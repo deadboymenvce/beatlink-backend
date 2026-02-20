@@ -121,15 +121,11 @@ class ACRCloudService:
                 logger.info("ℹ️ No music matches found")
                 return []
             
-            # Filter and format results
+            # Format all results (no score filter)
             matches = []
             
             for music in music_list:
                 score = music.get('score', 0)
-                
-                # Only keep matches with score >= 85 (high confidence)
-                if score < 85:
-                    continue
                 
                 title = music.get('title', 'Unknown')
                 artists = music.get('artists', [])
@@ -150,7 +146,7 @@ class ACRCloudService:
                 
                 matches.append(match)
             
-            logger.info(f"✅ Found {len(matches)} matches with score >= 85")
+            logger.info(f"✅ Found {len(matches)} matches (all scores included)")
             
             return matches
             
