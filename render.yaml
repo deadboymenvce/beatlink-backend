@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: beatlink-api
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
