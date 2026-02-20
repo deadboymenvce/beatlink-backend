@@ -84,6 +84,11 @@ class YouTubeService:
             
             if response.status_code != 200:
                 logger.error(f"❌ YouTube API error: {response.status_code}")
+                try:
+                    error_data = response.json()
+                    logger.error(f"Error details: {error_data}")
+                except:
+                    logger.error(f"Response text: {response.text[:500]}")
                 return {
                     'success': False,
                     'error': 'api_error',
