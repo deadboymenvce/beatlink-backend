@@ -89,6 +89,7 @@ class SpotifyService:
             response = requests.get(
                 f"https://api.spotify.com/v1/tracks/{track_id}",
                 headers={"Authorization": f"Bearer {token}"},
+                params={"market": "from_token"},  # Fix 403 errors for region-restricted tracks
                 timeout=10
             )
             
