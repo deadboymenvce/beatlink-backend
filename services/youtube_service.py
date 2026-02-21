@@ -13,7 +13,7 @@ class YouTubeService:
     """
     YouTube service using:
     1. YouTube Data API v3 for metadata
-    2. Apify Actor (streamers/youtube-video-downloader) for audio download
+    2. Apify Actor (streamers~youtube-video-downloader) for audio download
     """
 
     def __init__(self):
@@ -21,8 +21,8 @@ class YouTubeService:
         self.api_key = os.getenv("YOUTUBE_API_KEY")
         self.apify_token = os.getenv("APIFY_API_TOKEN")
         
-        # Apify Actor ID
-        self.actor_id = "streamers/youtube-video-downloader"
+        # Apify Actor endpoint (synchronous with dataset items)
+        self.apify_endpoint = "https://api.apify.com/v2/acts/streamers~youtube-video-downloader/run-sync-get-dataset-items"
         
         if self.api_key:
             logger.info("✅ YOUTUBE_API_KEY configured")
@@ -146,9 +146,9 @@ class YouTubeService:
 
     def download_audio(self, youtube_url):
         """
-        Download audio using Apify Actor with optimizations for ACR Cloud:
-        - Audio-only format (no video)
-        - Low quality (128kbps sufficient for fingerprinting)
+        Download audio using Apify Actor with optimizations:
+        - MP3 format (best for ACR Cloud)
+        - 144p quality (lowest, sufficient for audio)
         - Extract only 30 seconds (cost optimization)
         """
         video_id = self._extract_video_id(youtube_url) or 'unknown'
@@ -165,102 +165,109 @@ class YouTubeService:
         try:
             logger.info(f"🎵 Downloading audio for {video_id} via Apify...")
             
-            # Call Apify Actor with optimized settings
-            apify_url = f"https://api.apify.com/v2/acts/{self.actor_id}/run-sync-get-dataset-items"
-            
-            headers = {
-                "Authorization": f"Bearer {self.apify_token}",
-                "Content-Type": "application/json"
-            }
-            
-            # Actor input - request audio only, low quality
+            # Prepare Apify Actor input with optimizations
             payload = {
-                "videoUrls": [youtube_url],
-                "downloadFormat": "audio",  # Audio only, no video
-                "quality": "low"  # Low quality sufficient for ACR Cloud
+                "filenameTemplateParts": ["timestamp", "title", "uploader"],
+                "preferredFormat": "mp3",       # MP3 format (best for ACR Cloud)
+                "preferredQuality": "144p",     # Lowest quality (sufficient for audio)
+                "videos": [
+                    {
+                        "url": youtube_url
+                    }
+                ]
             }
             
-            logger.info("🚀 Calling Apify Actor...")
+            logger.info("🚀 Calling Apify Actor (synchronous)...")
+            logger.info(f"📤 Input: {payload}")
             
+            # Call Apify with token in query parameter
             response = requests.post(
-                apify_url,
-                headers=headers,
-                json=payload,
+                self.apify_endpoint,
                 params={"token": self.apify_token},
-                timeout=120  # 2 minutes timeout for Apify
+                json=payload,
+                timeout=180  # 3 minutes timeout for Apify
             )
+            
+            logger.info(f"📥 Apify response status: {response.status_code}")
             
             if response.status_code != 200 and response.status_code != 201:
                 logger.error(f"❌ Apify API error: {response.status_code}")
-                logger.error(f"Response: {response.text[:500]}")
+                logger.error(f"Response: {response.text[:1000]}")
                 return None
             
+            # Parse dataset items response
             results = response.json()
             
             if not results or len(results) == 0:
                 logger.error("❌ No results from Apify Actor")
                 return None
             
+            # Get first result
             result = results[0]
+            logger.info(f"📊 Result keys: {list(result.keys())}")
             
-            # Get download URL from Apify response
-            download_url = result.get('downloadUrl') or result.get('url') or result.get('audioUrl')
+            # Try to find download URL in various possible fields
+            download_url = None
+            
+            # Common field names for download URL
+            possible_fields = [
+                'downloadUrl', 
+                'url', 
+                'audioUrl', 
+                'fileUrl',
+                'videoUrl',
+                'link'
+            ]
+            
+            for field in possible_fields:
+                if field in result and result[field]:
+                    download_url = result[field]
+                    logger.info(f"✅ Found download URL in field '{field}'")
+                    break
             
             if not download_url:
-                logger.error(f"❌ No download URL in Apify response. Keys: {list(result.keys())}")
+                logger.error(f"❌ No download URL found in result. Available fields: {list(result.keys())}")
+                logger.error(f"Result sample: {str(result)[:500]}")
                 return None
             
             logger.info(f"✅ Got download URL from Apify")
             
             # Download audio file from Apify URL
-            logger.info(f"⬇️ Downloading audio file...")
+            logger.info(f"⬇️ Downloading audio file from URL...")
             
-            audio_response = requests.get(download_url, timeout=60, stream=True)
+            audio_response = requests.get(download_url, timeout=90, stream=True)
             
             if audio_response.status_code != 200:
-                logger.error(f"❌ Failed to download audio from URL")
+                logger.error(f"❌ Failed to download audio: {audio_response.status_code}")
                 return None
             
             # Save raw audio file
-            # Detect file extension from URL or default to webm
-            ext = 'webm'
-            if '.mp3' in download_url.lower():
-                ext = 'mp3'
-            elif '.m4a' in download_url.lower():
-                ext = 'm4a'
-            elif '.mp4' in download_url.lower():
-                ext = 'mp4'
-            
-            raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.{ext}')
+            # The file should already be MP3 from Apify
+            raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.mp3')
             
             with open(raw_path, 'wb') as f:
                 for chunk in audio_response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
             
-            logger.info(f"✅ Audio downloaded: {raw_path}")
+            file_size_kb = os.path.getsize(raw_path) // 1024
+            logger.info(f"✅ Audio downloaded: {raw_path} ({file_size_kb} KB)")
             
             # OPTIMIZATION: Extract only 30 seconds (not 60) to minimize data transfer
             # This is where we save costs - ACR Cloud doesn't need more than 30s
             mp3_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.mp3')
             
-            logger.info("🔄 Converting to MP3 and extracting 30 seconds (optimized for ACR Cloud)...")
+            logger.info("🔄 Extracting 30 seconds (optimized for ACR Cloud)...")
             
-            # Use FFmpeg to:
-            # 1. Convert to MP3 format (best for ACR Cloud)
-            # 2. Extract only 30 seconds starting from 15s mark
-            # 3. Low quality 128kbps (sufficient for fingerprinting)
+            # Use FFmpeg to extract only 30 seconds starting from 15s mark
+            # This avoids intros and provides clean audio for fingerprinting
             ffmpeg_result = subprocess.run(
                 [
                     'ffmpeg',
                     '-i', raw_path,
                     '-ss', '15',       # Start at 15 seconds (avoid intro)
                     '-t', '30',        # Duration 30 seconds (optimized vs 60s)
-                    '-vn',             # No video
-                    '-acodec', 'libmp3lame',
-                    '-b:a', '128k',    # 128kbps (low quality, perfect for ACR Cloud)
-                    '-ar', '44100',    # Standard sample rate
-                    '-ac', '2',        # Stereo
+                    '-acodec', 'copy', # Copy codec (no re-encoding, faster)
                     '-y',              # Overwrite
                     mp3_path
                 ],
@@ -274,19 +281,19 @@ class YouTubeService:
                 os.remove(raw_path)
             
             if ffmpeg_result.returncode != 0:
-                logger.error(f"❌ FFmpeg error: {ffmpeg_result.stderr[-300:]}")
+                logger.error(f"❌ FFmpeg error: {ffmpeg_result.stderr[-500:]}")
                 return None
             
             if os.path.exists(mp3_path):
                 size_kb = os.path.getsize(mp3_path) // 1024
-                logger.info(f"✅ MP3 ready: {mp3_path} ({size_kb} KB) - Optimized 30s @ 128kbps")
+                logger.info(f"✅ MP3 ready: {mp3_path} ({size_kb} KB) - Optimized 30s extract")
                 return mp3_path
             
-            logger.error("❌ MP3 file not found after conversion")
+            logger.error("❌ MP3 file not found after extraction")
             return None
             
         except requests.exceptions.Timeout:
-            logger.error("❌ Apify API timeout (120s)")
+            logger.error("❌ Apify API timeout (180s)")
             return None
             
         except Exception as e:
