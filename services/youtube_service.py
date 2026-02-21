@@ -171,9 +171,10 @@ class YouTubeService:
         try:
             logger.info(f"🎵 Downloading audio for {video_id} via Apify (marielise.dev)...")
             
-            # Prepare Apify Actor input (SIMPLE format - tested and working)
+            # Prepare Apify Actor input with quality optimization
             payload = {
-                "format": "mp3",  # MP3 format directly
+                "format": "mp3",     # MP3 format directly
+                "quality": "360",    # Lowest quality (360p minimum) - reduces file size and Apify costs
                 "urls": [
                     {
                         "url": youtube_url
