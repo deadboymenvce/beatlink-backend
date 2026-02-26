@@ -250,7 +250,7 @@ class YouTubeService:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=(10, 120)
+                timeout=60
             )
             
             # Clean up raw file immediately to save space
