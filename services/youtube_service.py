@@ -189,7 +189,7 @@ class YouTubeService:
             response = requests.get(
                 api_url,
                 headers=headers,
-                timeout=60,
+                timeout=(10, 120),
                 stream=True  # Important: stream the binary response
             )
             
@@ -250,7 +250,7 @@ class YouTubeService:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=(10, 120)
             )
             
             # Clean up raw file immediately to save space
