@@ -37,7 +37,7 @@ class ACRCloudService:
         Identify audio file using ACR Cloud
         
         Returns:
-        List of matched songs with score >= 85
+        List of matched songs with complete data
         [
             {
                 'title': 'Song Title',
@@ -121,15 +121,42 @@ class ACRCloudService:
                 logger.info("ℹ️ No music matches found")
                 return []
             
-            # Format all results (no score filter)
+            logger.info(f"📊 ACR Cloud returned {len(music_list)} raw results")
+            
+            # Format and FILTER results
             matches = []
+            skipped = 0
             
             for music in music_list:
                 score = music.get('score', 0)
                 
-                title = music.get('title', 'Unknown')
+                # GET TITLE with validation
+                title = music.get('title', '').strip()
+                if not title:
+                    logger.warning(f"⚠️ Skipping result without title")
+                    skipped += 1
+                    continue
+                
+                # GET ARTISTS with validation
                 artists = music.get('artists', [])
-                artist_names = ', '.join([a.get('name', 'Unknown') for a in artists])
+                if not artists or len(artists) == 0:
+                    logger.warning(f"⚠️ Skipping '{title}' - no artists")
+                    skipped += 1
+                    continue
+                
+                # Build artist names string
+                artist_names_list = []
+                for artist in artists:
+                    name = artist.get('name', '').strip()
+                    if name:
+                        artist_names_list.append(name)
+                
+                if not artist_names_list:
+                    logger.warning(f"⚠️ Skipping '{title}' - empty artist names")
+                    skipped += 1
+                    continue
+                
+                artist_names = ', '.join(artist_names_list)
                 
                 # Get Spotify ID if available
                 external_metadata = music.get('external_metadata', {})
@@ -137,6 +164,7 @@ class ACRCloudService:
                 spotify_track = spotify_data.get('track', {})
                 spotify_id = spotify_track.get('id', '')
                 
+                # Create match object
                 match = {
                     'title': title,
                     'artists': artist_names,
@@ -146,7 +174,10 @@ class ACRCloudService:
                 
                 matches.append(match)
             
-            logger.info(f"✅ Found {len(matches)} matches (all scores included)")
+            if skipped > 0:
+                logger.info(f"⚠️ Skipped {skipped} invalid results")
+            
+            logger.info(f"✅ Found {len(matches)} valid matches")
             
             return matches
             
