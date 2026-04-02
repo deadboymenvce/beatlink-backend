@@ -1,172 +1,207 @@
-"""
-Spotify Service - Handles all Spotify API interactions and web scraping
-Enriches track metadata from ACRCloud with Spotify data + artist scraping
-"""
-
 import os
 import logging
-import base64
 import requests
-from typing import List, Dict, Optional
+import base64
 from .spotify_scraper_service import SpotifyScraperService
 
 logger = logging.getLogger(__name__)
 
 
 class SpotifyService:
-    """Service to interact with Spotify Web API and scrape artist data"""
-    
+    """Service to enrich track metadata using Spotify API + scraping"""
+
     def __init__(self):
-        self.client_id = os.getenv('SPOTIFY_CLIENT_ID')
-        self.client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
-        self.access_token = None
+        self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
+        self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        self.token = None
+        self.token_expires_at = 0
         self.scraper = SpotifyScraperService()
         
-        if not self.client_id or not self.client_secret:
-            logger.error("❌ Spotify credentials not found in environment variables")
-            raise ValueError("Missing Spotify credentials")
+        if all([self.client_id, self.client_secret]):
+            logger.info("✅ Spotify credentials configured")
+        else:
+            logger.error("❌ Spotify credentials missing")
+
+    def _get_token(self):
+        """Get Spotify API access token (client credentials flow)"""
+        import time
         
-        logger.info("✅ SpotifyService initialized")
-        self._get_access_token()
-    
-    def _get_access_token(self):
-        """Get Spotify API access token using Client Credentials flow"""
-        try:
-            auth_string = f"{self.client_id}:{self.client_secret}"
-            auth_bytes = auth_string.encode("utf-8")
-            auth_base64 = base64.b64encode(auth_bytes).decode("utf-8")
-            
-            url = "https://accounts.spotify.com/api/token"
-            headers = {
-                "Authorization": f"Basic {auth_base64}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-            data = {"grant_type": "client_credentials"}
-            
-            response = requests.post(url, headers=headers, data=data)
-            response.raise_for_status()
-            
-            json_result = response.json()
-            self.access_token = json_result["access_token"]
-            logger.info("✅ Spotify access token obtained")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to get Spotify access token: {e}")
-            raise
-    
-    def _get_auth_header(self) -> Dict[str, str]:
-        """Get authorization header for Spotify API requests"""
-        return {"Authorization": f"Bearer {self.access_token}"}
-    
-    def get_track(self, track_id: str) -> Optional[Dict]:
-        """
-        Get track information from Spotify API
+        # Return cached token if still valid
+        if self.token and time.time() < self.token_expires_at:
+            return self.token
         
-        Args:
-            track_id: Spotify track ID
-            
-        Returns:
-            Track data dict or None if not found
-        """
         try:
-            url = f"https://api.spotify.com/v1/tracks/{track_id}"
-            headers = self._get_auth_header()
+            # Encode credentials
+            credentials = f"{self.client_id}:{self.client_secret}"
+            credentials_b64 = base64.b64encode(credentials.encode()).decode()
             
-            response = requests.get(url, headers=headers)
+            # Request token
+            response = requests.post(
+                "https://accounts.spotify.com/api/token",
+                headers={
+                    "Authorization": f"Basic {credentials_b64}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={"grant_type": "client_credentials"},
+                timeout=10
+            )
             
-            if response.status_code == 401:
-                # Token expired, get new one
-                logger.info("🔄 Access token expired, refreshing...")
-                self._get_access_token()
-                headers = self._get_auth_header()
-                response = requests.get(url, headers=headers)
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"⚠️ Track {track_id} not found (HTTP {response.status_code})")
+            if response.status_code != 200:
+                logger.error(f"❌ Failed to get Spotify token: {response.status_code}")
                 return None
-                
+            
+            data = response.json()
+            self.token = data.get('access_token')
+            expires_in = data.get('expires_in', 3600)
+            self.token_expires_at = time.time() + expires_in - 60  # Refresh 1 min early
+            
+            logger.info("✅ Spotify token refreshed")
+            return self.token
+            
         except Exception as e:
-            logger.error(f"❌ Error fetching track {track_id}: {e}")
+            logger.error(f"❌ Error getting Spotify token: {str(e)}")
             return None
-    
-    def enrich_tracks(self, acr_matches: List[Dict]) -> List[Dict]:
+
+    def _get_track_details(self, spotify_id):
         """
-        Enrich ACRCloud matches with Spotify metadata + artist scraping
-        
-        This is the main method that:
-        1. Fetches track data from Spotify API
-        2. Extracts artist IDs
-        3. Scrapes artist pages for listeners, city, Instagram
-        4. Merges all data together
+        Get track details from Spotify API
         
         Args:
-            acr_matches: List of matches from ACRCloud
-            
+            spotify_id: 'spotify:track:xxx' or just the track ID
+        
         Returns:
-            List of enriched track dicts with all metadata
+            {
+                'spotify_url': str,
+                'cover_url': str,
+                'release_date': str,
+                'spotify_author_ID': str,  # NEW - first artist ID
+                'label': str  # Kept for compatibility (even if unused)
+            }
         """
-        if not acr_matches:
+        # Extract track ID from spotify:track:xxx format
+        if spotify_id.startswith('spotify:track:'):
+            track_id = spotify_id.split(':')[2]
+        else:
+            track_id = spotify_id
+        
+        token = self._get_token()
+        if not token:
+            return {}
+        
+        try:
+            response = requests.get(
+                f"https://api.spotify.com/v1/tracks/{track_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                logger.warning(f"⚠️ Spotify API error for track {track_id}: {response.status_code}")
+                return {}
+            
+            data = response.json()
+            
+            # Extract album info
+            album = data.get('album', {})
+            images = album.get('images', [])
+            
+            # Get cover image (300x300 preferred)
+            cover_url = ''
+            if images:
+                # Try to find 300x300 image
+                for img in images:
+                    if img.get('height') == 300:
+                        cover_url = img.get('url', '')
+                        break
+                # Fallback to first image
+                if not cover_url:
+                    cover_url = images[0].get('url', '')
+            
+            # Get label (kept for compatibility even if field removed from Bubble)
+            label = album.get('label', '')
+            
+            # Get release date
+            release_date = album.get('release_date', '')
+            
+            # Build Spotify URL
+            spotify_url = f"https://open.spotify.com/track/{track_id}"
+            
+            # NEW: Get first artist ID for scraping
+            artists = data.get('artists', [])
+            spotify_author_id = artists[0]['id'] if artists else None
+            
+            return {
+                'spotify_url': spotify_url,
+                'cover_url': cover_url,
+                'release_date': release_date,
+                'spotify_author_ID': spotify_author_id,  # NEW
+                'label': label
+            }
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error getting track details: {str(e)}")
+            return {}
+
+    def enrich_tracks(self, matches):
+        """
+        Enrich ACR Cloud matches with Spotify metadata + artist scraping
+        
+        Args:
+            matches: List of ACR Cloud matches (pre-processed format)
+                     Each match has: spotify_id, title, artists, score
+        
+        Returns:
+            List of enriched tracks with Spotify data + scraped artist data
+        """
+        if not matches:
             return []
         
-        logger.info(f"🎵 Enriching {len(acr_matches)} tracks with Spotify data...")
-        
-        enriched_songs = []
+        enriched = []
         artist_ids_to_scrape = []
         
-        # Step 1: Fetch track data from Spotify API
-        for match in acr_matches:
-            try:
-                # Extract Spotify track ID from ACRCloud match
-                spotify_data = match.get('spotify', {})
-                track_data = spotify_data.get('track', {})
-                track_id = track_data.get('id')
-                
-                if not track_id:
-                    logger.warning("⚠️ No Spotify track ID in ACRCloud match")
-                    continue
-                
-                # Get full track info from Spotify API
-                full_track = self.get_track(track_id)
-                
-                if not full_track:
-                    continue
-                
-                # Extract basic track info
-                artists_list = full_track.get('artists', [])
-                artist_names = ', '.join([artist['name'] for artist in artists_list])
-                
-                # Get first artist ID for scraping
-                spotify_author_id = artists_list[0]['id'] if artists_list else None
-                
-                # Get album info
-                album = full_track.get('album', {})
-                images = album.get('images', [])
-                cover_url = images[0]['url'] if images else None
-                
-                # Build enriched song object (without scraped data yet)
-                enriched_song = {
-                    'title': full_track.get('name'),
-                    'artists': artist_names,
-                    'spotify_url': full_track.get('external_urls', {}).get('spotify'),
-                    'spotify_author_ID': spotify_author_id,  # NEW
-                    'cover_url': cover_url,
-                    'release_date': album.get('release_date'),
-                    'score': match.get('score', 0)
-                }
-                
-                enriched_songs.append(enriched_song)
-                
-                # Collect artist ID for scraping
-                if spotify_author_id:
-                    artist_ids_to_scrape.append(spotify_author_id)
-                
-            except Exception as e:
-                logger.error(f"❌ Error enriching track: {e}")
+        # Step 1: Get Spotify details for each match
+        for match in matches:
+            spotify_id = match.get('spotify_id', '')
+            
+            if not spotify_id:
+                # No Spotify ID, return basic info with fallback values
+                enriched.append({
+                    'title': match['title'],
+                    'artists': match['artists'],
+                    'spotify_url': '',
+                    'spotify_author_ID': None,  # NEW
+                    'cover_url': '',
+                    'release_date': '',
+                    'score': match['score'],
+                    # Scraping fallbacks
+                    'listeners': 0,  # NEW
+                    'city': None,  # NEW
+                    'instagram_url': None  # NEW
+                })
                 continue
-        
-        logger.info(f"✅ Enriched {len(enriched_songs)} tracks with Spotify API data")
+            
+            # Get Spotify details
+            details = self._get_track_details(spotify_id)
+            
+            # Build enriched track
+            enriched_track = {
+                'title': match['title'],
+                'artists': match['artists'],
+                'spotify_url': details.get('spotify_url', ''),
+                'spotify_author_ID': details.get('spotify_author_ID'),  # NEW
+                'cover_url': details.get('cover_url', ''),
+                'release_date': details.get('release_date', ''),
+                'score': match['score']
+            }
+            
+            enriched.append(enriched_track)
+            
+            # Collect artist ID for scraping
+            artist_id = details.get('spotify_author_ID')
+            if artist_id:
+                artist_ids_to_scrape.append(artist_id)
+            
+        logger.info(f"✅ Enriched {len(enriched)} tracks with Spotify API data")
         
         # Step 2: Scrape all artist pages in parallel
         if artist_ids_to_scrape:
@@ -175,33 +210,45 @@ class SpotifyService:
             try:
                 scraped_data = self.scraper.scrape_artists(artist_ids_to_scrape)
                 
-                # Step 3: Merge scraped data with enriched songs
-                for i, song in enumerate(enriched_songs):
-                    if i < len(scraped_data):
-                        scraped = scraped_data[i]
-                        song['listeners'] = scraped.get('listeners', 0)  # NEW
-                        song['city'] = scraped.get('city')  # NEW (can be None)
-                        song['instagram_url'] = scraped.get('instagram_url')  # NEW (can be None)
+                # Step 3: Merge scraped data with enriched tracks
+                scrape_index = 0
+                for track in enriched:
+                    if track.get('spotify_author_ID'):
+                        # This track has an artist to scrape
+                        if scrape_index < len(scraped_data):
+                            scraped = scraped_data[scrape_index]
+                            track['listeners'] = scraped.get('listeners', 0)
+                            track['city'] = scraped.get('city')
+                            track['instagram_url'] = scraped.get('instagram_url')
+                            scrape_index += 1
+                        else:
+                            # Fallback if scraping failed
+                            track['listeners'] = 0
+                            track['city'] = None
+                            track['instagram_url'] = None
                     else:
-                        # Fallback if scraping failed for this artist
-                        song['listeners'] = 0
-                        song['city'] = None
-                        song['instagram_url'] = None
+                        # No artist ID, use fallbacks
+                        track['listeners'] = 0
+                        track['city'] = None
+                        track['instagram_url'] = None
                 
-                logger.info(f"✅ Merged scraped data with {len(enriched_songs)} tracks")
+                logger.info(f"✅ Merged scraped data with {len(enriched)} tracks")
                 
             except Exception as e:
                 logger.error(f"❌ Error during artist scraping: {e}")
                 # If scraping completely fails, add default values
-                for song in enriched_songs:
-                    song['listeners'] = 0
-                    song['city'] = None
-                    song['instagram_url'] = None
+                for track in enriched:
+                    if 'listeners' not in track:
+                        track['listeners'] = 0
+                        track['city'] = None
+                        track['instagram_url'] = None
         else:
             # No artists to scrape, add default values
-            for song in enriched_songs:
-                song['listeners'] = 0
-                song['city'] = None
-                song['instagram_url'] = None
+            logger.info("ℹ️ No artists to scrape")
+            for track in enriched:
+                if 'listeners' not in track:
+                    track['listeners'] = 0
+                    track['city'] = None
+                    track['instagram_url'] = None
         
-        return enriched_songs
+        return enriched
