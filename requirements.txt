@@ -1,5 +1,25 @@
+# Flask web framework
 Flask==3.0.0
 flask-cors==4.0.0
+
+# HTTP requests
 requests==2.31.0
+
+# Async HTTP (for parallel scraping)
+aiohttp==3.9.1
+
+# HTML parsing (for Spotify scraping)
+beautifulsoup4==4.12.2
+lxml==5.1.0
+
+# ACRCloud SDK
+pyacrcloud==1.0.1
+
+# Environment variables
 python-dotenv==1.0.0
-gunicorn==21.2.0
+
+# Apify client (for YouTube downloads)
+apify-client==1.5.1
+
+# Logging
+colorlog==6.8.0
