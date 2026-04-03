@@ -3,6 +3,7 @@ import logging
 import requests
 import base64
 import time
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,23 @@ class SpotifyService:
             label = album.get('label', '')
             
             # Get release date
-            release_date = album.get('release_date', '')
+            release_date_str = album.get('release_date', '')
+            release_date = None
+            if release_date_str:
+                try:
+                    # Spotify returns dates in different formats:
+                    # - Full: "2024-11-29" (YYYY-MM-DD)
+                    # - Year-Month: "2024-11" (YYYY-MM)
+                    # - Year only: "2024" (YYYY)
+                    if len(release_date_str) == 10:  # YYYY-MM-DD
+                        release_date = datetime.strptime(release_date_str, '%Y-%m-%d')
+                    elif len(release_date_str) == 7:  # YYYY-MM
+                        release_date = datetime.strptime(release_date_str + '-01', '%Y-%m-%d')
+                    elif len(release_date_str) == 4:  # YYYY
+                        release_date = datetime.strptime(release_date_str + '-01-01', '%Y-%m-%d')
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not parse release_date '{release_date_str}': {e}")
+                    release_date = None
             
             # Build Spotify URL
             spotify_url = f"https://open.spotify.com/track/{track_id}"
@@ -314,7 +331,7 @@ class SpotifyService:
                     'spotify_url': '',
                     'spotify_author_ID': None,
                     'cover_url': '',
-                    'release_date': '',
+                    'release_date': None,
                     'score': match['score'],
                     'listeners': 0,
                     'city': None,
@@ -332,7 +349,7 @@ class SpotifyService:
                 'spotify_url': details.get('spotify_url', ''),
                 'spotify_author_ID': details.get('spotify_author_ID'),
                 'cover_url': details.get('cover_url', ''),
-                'release_date': details.get('release_date', ''),
+                'release_date': details.get('release_date'),
                 'score': match['score']
             }
             
