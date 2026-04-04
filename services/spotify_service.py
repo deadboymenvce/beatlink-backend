@@ -1,8 +1,10 @@
+
 import os
 import logging
 import requests
 import base64
 import time
+from datetime import datetime
  
 logger = logging.getLogger(__name__)
  
@@ -125,8 +127,24 @@ class SpotifyService:
             # Get label (kept for compatibility)
             label = album.get('label', '')
             
-            # Get release date (keep as string - Bubble handles it)
-            release_date = album.get('release_date', '')
+            # Get release date
+            release_date_str = album.get('release_date', '')
+            release_date = None
+            if release_date_str:
+                try:
+                    # Spotify returns dates in different formats:
+                    # - Full: "2024-11-29" (YYYY-MM-DD)
+                    # - Year-Month: "2024-11" (YYYY-MM)
+                    # - Year only: "2024" (YYYY)
+                    if len(release_date_str) == 10:  # YYYY-MM-DD
+                        release_date = datetime.strptime(release_date_str, '%Y-%m-%d')
+                    elif len(release_date_str) == 7:  # YYYY-MM
+                        release_date = datetime.strptime(release_date_str + '-01', '%Y-%m-%d')
+                    elif len(release_date_str) == 4:  # YYYY
+                        release_date = datetime.strptime(release_date_str + '-01-01', '%Y-%m-%d')
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not parse release_date '{release_date_str}': {e}")
+                    release_date = None
             
             # Build Spotify URL
             spotify_url = f"https://open.spotify.com/track/{track_id}"
@@ -138,7 +156,7 @@ class SpotifyService:
             return {
                 'spotify_url': spotify_url,
                 'cover_url': cover_url,
-                'release_date': release_date,
+                'release_date': release_date.strftime('%Y-%m-%d') if release_date else None,
                 'spotify_author_ID': spotify_author_id,
                 'label': label
             }
