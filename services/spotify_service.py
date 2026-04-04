@@ -4,13 +4,13 @@ import requests
 import base64
 import time
 from datetime import datetime
-
+ 
 logger = logging.getLogger(__name__)
-
-
+ 
+ 
 class SpotifyService:
     """Service to enrich track metadata using Spotify API + RapidAPI scraping"""
-
+ 
     def __init__(self):
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
@@ -28,7 +28,7 @@ class SpotifyService:
             logger.info("✅ RapidAPI key configured")
         else:
             logger.warning("⚠️ RapidAPI key missing - artist data will use fallback values")
-
+ 
     def _get_token(self):
         """Get Spotify API access token (client credentials flow)"""
         
@@ -67,7 +67,7 @@ class SpotifyService:
         except Exception as e:
             logger.error(f"❌ Error getting Spotify token: {str(e)}")
             return None
-
+ 
     def _get_track_details(self, spotify_id):
         """
         Get track details from Spotify API
@@ -155,7 +155,7 @@ class SpotifyService:
             return {
                 'spotify_url': spotify_url,
                 'cover_url': cover_url,
-                'release_date': release_date,
+                'release_date': release_date.strftime('%Y-%m-%d') if release_date else None,
                 'spotify_author_ID': spotify_author_id,
                 'label': label
             }
@@ -163,7 +163,7 @@ class SpotifyService:
         except Exception as e:
             logger.warning(f"⚠️ Error getting track details: {str(e)}")
             return {}
-
+ 
     def _get_artist_data_rapidapi(self, artist_id):
         """
         Fetch artist data from RapidAPI (Real-Time Spotify Data Scraper)
@@ -261,7 +261,7 @@ class SpotifyService:
         # Fallback if all retries failed
         logger.warning(f"⚠️ Using fallback values for {artist_id}")
         return {'listeners': 0, 'city': None, 'instagram_url': None}
-
+ 
     def _get_artist_data_with_cache(self, artist_id):
         """
         Get artist data with 24h cache
@@ -301,7 +301,7 @@ class SpotifyService:
         }
         
         return data
-
+ 
     def enrich_tracks(self, matches):
         """
         Enrich ACR Cloud matches with Spotify metadata + RapidAPI artist data
