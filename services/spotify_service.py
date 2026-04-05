@@ -3,13 +3,13 @@ import logging
 import requests
 import base64
 import time
- 
+
 logger = logging.getLogger(__name__)
- 
- 
+
+
 class SpotifyService:
     """Service to enrich track metadata using Spotify API + RapidAPI scraping"""
- 
+
     def __init__(self):
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
@@ -27,7 +27,7 @@ class SpotifyService:
             logger.info("✅ RapidAPI key configured")
         else:
             logger.warning("⚠️ RapidAPI key missing - artist data will use fallback values")
- 
+
     def _get_token(self):
         """Get Spotify API access token (client credentials flow)"""
         
@@ -66,7 +66,7 @@ class SpotifyService:
         except Exception as e:
             logger.error(f"❌ Error getting Spotify token: {str(e)}")
             return None
- 
+
     def _get_track_details(self, spotify_id):
         """
         Get track details from Spotify API
@@ -146,7 +146,7 @@ class SpotifyService:
         except Exception as e:
             logger.warning(f"⚠️ Error getting track details: {str(e)}")
             return {}
- 
+
     def _get_artist_data_rapidapi(self, artist_id):
         """
         Fetch artist data from RapidAPI (Real-Time Spotify Data Scraper)
@@ -198,13 +198,21 @@ class SpotifyService:
                         if city_name and country:
                             city = f"{city_name}, {country}"
                     
-                    # Parse Instagram (OPTIONAL)
+                    # Parse Instagram and Twitter (OPTIONAL)
                     profile = artist_data.get('profile', {})
                     external_links = profile.get('externalLinks', {}).get('items', [])
                     instagram_url = None
+                    twitter_url = None
+                    
                     for link in external_links:
-                        if link.get('name') == 'INSTAGRAM':
+                        link_name = link.get('name')
+                        if link_name == 'INSTAGRAM':
                             instagram_url = link.get('url')
+                        elif link_name == 'TWITTER':
+                            twitter_url = link.get('url')
+                        
+                        # Stop early if we found both
+                        if instagram_url and twitter_url:
                             break
                     
                     # Parse last release date (OPTIONAL)
@@ -272,6 +280,7 @@ class SpotifyService:
                         'listeners': listeners,
                         'city': city,
                         'instagram_url': instagram_url,
+                        'twitter_url': twitter_url,
                         'last_release_date': last_release_date,
                         'artist_image': artist_image
                     }
@@ -304,8 +313,8 @@ class SpotifyService:
         
         # Fallback if all retries failed
         logger.warning(f"⚠️ Using fallback values for {artist_id}")
-        return {'listeners': 0, 'city': None, 'instagram_url': None, 'last_release_date': None, 'artist_image': None}
- 
+        return {'listeners': 0, 'city': None, 'instagram_url': None, 'twitter_url': None, 'last_release_date': None, 'artist_image': None}
+
     def _get_artist_data_with_cache(self, artist_id):
         """
         Get artist data with 24h cache
@@ -345,7 +354,7 @@ class SpotifyService:
         }
         
         return data
- 
+
     def enrich_tracks(self, matches):
         """
         Enrich ACR Cloud matches with Spotify metadata + RapidAPI artist data
@@ -380,6 +389,7 @@ class SpotifyService:
                     'listeners': 0,
                     'city': None,
                     'instagram_url': None,
+                    'twitter_url': None,
                     'last_release_date': None,
                     'artist_image': None
                 })
@@ -427,6 +437,7 @@ class SpotifyService:
                         track['listeners'] = scraped.get('listeners', 0)
                         track['city'] = scraped.get('city')
                         track['instagram_url'] = scraped.get('instagram_url')
+                        track['twitter_url'] = scraped.get('twitter_url')
                         track['last_release_date'] = scraped.get('last_release_date')
                         track['artist_image'] = scraped.get('artist_image')
                         scrape_index += 1
@@ -435,6 +446,7 @@ class SpotifyService:
                         track['listeners'] = 0
                         track['city'] = None
                         track['instagram_url'] = None
+                        track['twitter_url'] = None
                         track['last_release_date'] = None
                         track['artist_image'] = None
                 else:
@@ -442,6 +454,7 @@ class SpotifyService:
                     track['listeners'] = 0
                     track['city'] = None
                     track['instagram_url'] = None
+                    track['twitter_url'] = None
                     track['last_release_date'] = None
                     track['artist_image'] = None
             
@@ -454,6 +467,7 @@ class SpotifyService:
                     track['listeners'] = 0
                     track['city'] = None
                     track['instagram_url'] = None
+                    track['twitter_url'] = None
                     track['last_release_date'] = None
                     track['artist_image'] = None
         
