@@ -256,13 +256,24 @@ class SpotifyService:
                                 else:
                                     last_release_date = f"{year}-01-01"
                     
+                    # Parse artist profile image (OPTIONAL)
+                    visuals = artist_data.get('visuals', {})
+                    avatar_image = visuals.get('avatarImage', {})
+                    sources = avatar_image.get('sources', [])
+                    artist_image = None
+                    
+                    if sources and len(sources) > 0:
+                        # Take first source (640x640, highest quality)
+                        artist_image = sources[0].get('url', '')
+                    
                     logger.info(f"✅ RapidAPI success for {artist_id}: {listeners} listeners")
                     
                     return {
                         'listeners': listeners,
                         'city': city,
                         'instagram_url': instagram_url,
-                        'last_release_date': last_release_date
+                        'last_release_date': last_release_date,
+                        'artist_image': artist_image
                     }
                 
                 elif response.status_code == 429:
@@ -293,7 +304,7 @@ class SpotifyService:
         
         # Fallback if all retries failed
         logger.warning(f"⚠️ Using fallback values for {artist_id}")
-        return {'listeners': 0, 'city': None, 'instagram_url': None, 'last_release_date': None}
+        return {'listeners': 0, 'city': None, 'instagram_url': None, 'last_release_date': None, 'artist_image': None}
  
     def _get_artist_data_with_cache(self, artist_id):
         """
@@ -369,7 +380,8 @@ class SpotifyService:
                     'listeners': 0,
                     'city': None,
                     'instagram_url': None,
-                    'last_release_date': None
+                    'last_release_date': None,
+                    'artist_image': None
                 })
                 continue
             
@@ -416,6 +428,7 @@ class SpotifyService:
                         track['city'] = scraped.get('city')
                         track['instagram_url'] = scraped.get('instagram_url')
                         track['last_release_date'] = scraped.get('last_release_date')
+                        track['artist_image'] = scraped.get('artist_image')
                         scrape_index += 1
                     else:
                         # Fallback if index mismatch
@@ -423,12 +436,14 @@ class SpotifyService:
                         track['city'] = None
                         track['instagram_url'] = None
                         track['last_release_date'] = None
+                        track['artist_image'] = None
                 else:
                     # No artist ID, use fallbacks
                     track['listeners'] = 0
                     track['city'] = None
                     track['instagram_url'] = None
                     track['last_release_date'] = None
+                    track['artist_image'] = None
             
             logger.info(f"✅ Merged artist data with {len(enriched)} track(s)")
         else:
@@ -440,5 +455,6 @@ class SpotifyService:
                     track['city'] = None
                     track['instagram_url'] = None
                     track['last_release_date'] = None
+                    track['artist_image'] = None
         
         return enriched
