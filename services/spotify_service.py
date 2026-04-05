@@ -3,7 +3,6 @@ import logging
 import requests
 import base64
 import time
-from datetime import datetime
  
 logger = logging.getLogger(__name__)
  
@@ -126,24 +125,8 @@ class SpotifyService:
             # Get label (kept for compatibility)
             label = album.get('label', '')
             
-            # Get release date
-            release_date_str = album.get('release_date', '')
-            release_date = None
-            if release_date_str:
-                try:
-                    # Spotify returns dates in different formats:
-                    # - Full: "2024-11-29" (YYYY-MM-DD)
-                    # - Year-Month: "2024-11" (YYYY-MM)
-                    # - Year only: "2024" (YYYY)
-                    if len(release_date_str) == 10:  # YYYY-MM-DD
-                        release_date = datetime.strptime(release_date_str, '%Y-%m-%d')
-                    elif len(release_date_str) == 7:  # YYYY-MM
-                        release_date = datetime.strptime(release_date_str + '-01', '%Y-%m-%d')
-                    elif len(release_date_str) == 4:  # YYYY
-                        release_date = datetime.strptime(release_date_str + '-01-01', '%Y-%m-%d')
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not parse release_date '{release_date_str}': {e}")
-                    release_date = None
+            # Get release date (keep as string - Bubble handles it)
+            release_date = album.get('release_date', '')
             
             # Build Spotify URL
             spotify_url = f"https://open.spotify.com/track/{track_id}"
@@ -155,7 +138,7 @@ class SpotifyService:
             return {
                 'spotify_url': spotify_url,
                 'cover_url': cover_url,
-                'release_date': release_date.strftime('%Y-%m-%d') if release_date else None,
+                'release_date': release_date,
                 'spotify_author_ID': spotify_author_id,
                 'label': label
             }
@@ -224,12 +207,33 @@ class SpotifyService:
                             instagram_url = link.get('url')
                             break
                     
+                    # Parse last release date (OPTIONAL)
+                    discography = artist_data.get('discography', {})
+                    latest = discography.get('latest', {})
+                    date_info = latest.get('date', {})
+                    last_release_date = None
+                    
+                    if date_info:
+                        year = date_info.get('year')
+                        month = date_info.get('month')
+                        day = date_info.get('day')
+                        
+                        if year:
+                            # Format: YYYY-MM-DD (like Results page)
+                            if day and month:
+                                last_release_date = f"{year}-{month:02d}-{day:02d}"
+                            elif month:
+                                last_release_date = f"{year}-{month:02d}-01"
+                            else:
+                                last_release_date = f"{year}-01-01"
+                    
                     logger.info(f"✅ RapidAPI success for {artist_id}: {listeners} listeners")
                     
                     return {
                         'listeners': listeners,
                         'city': city,
-                        'instagram_url': instagram_url
+                        'instagram_url': instagram_url,
+                        'last_release_date': last_release_date
                     }
                 
                 elif response.status_code == 429:
@@ -260,7 +264,7 @@ class SpotifyService:
         
         # Fallback if all retries failed
         logger.warning(f"⚠️ Using fallback values for {artist_id}")
-        return {'listeners': 0, 'city': None, 'instagram_url': None}
+        return {'listeners': 0, 'city': None, 'instagram_url': None, 'last_release_date': None}
  
     def _get_artist_data_with_cache(self, artist_id):
         """
@@ -335,7 +339,8 @@ class SpotifyService:
                     'score': match['score'],
                     'listeners': 0,
                     'city': None,
-                    'instagram_url': None
+                    'instagram_url': None,
+                    'last_release_date': None
                 })
                 continue
             
@@ -381,17 +386,20 @@ class SpotifyService:
                         track['listeners'] = scraped.get('listeners', 0)
                         track['city'] = scraped.get('city')
                         track['instagram_url'] = scraped.get('instagram_url')
+                        track['last_release_date'] = scraped.get('last_release_date')
                         scrape_index += 1
                     else:
                         # Fallback if index mismatch
                         track['listeners'] = 0
                         track['city'] = None
                         track['instagram_url'] = None
+                        track['last_release_date'] = None
                 else:
                     # No artist ID, use fallbacks
                     track['listeners'] = 0
                     track['city'] = None
                     track['instagram_url'] = None
+                    track['last_release_date'] = None
             
             logger.info(f"✅ Merged artist data with {len(enriched)} track(s)")
         else:
@@ -402,5 +410,6 @@ class SpotifyService:
                     track['listeners'] = 0
                     track['city'] = None
                     track['instagram_url'] = None
+                    track['last_release_date'] = None
         
         return enriched
