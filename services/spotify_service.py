@@ -208,24 +208,53 @@ class SpotifyService:
                             break
                     
                     # Parse last release date (OPTIONAL)
+                    # Try to get complete date from singles (has day/month/year)
+                    # Fallback to latest if singles not available (may only have year)
                     discography = artist_data.get('discography', {})
-                    latest = discography.get('latest', {})
-                    date_info = latest.get('date', {})
                     last_release_date = None
                     
-                    if date_info:
-                        year = date_info.get('year')
-                        month = date_info.get('month')
-                        day = date_info.get('day')
+                    # Method 1: Extract from singles (most complete)
+                    singles = discography.get('singles', {})
+                    singles_items = singles.get('items', [])
+                    
+                    if singles_items and len(singles_items) > 0:
+                        releases = singles_items[0].get('releases', {})
+                        releases_items = releases.get('items', [])
                         
-                        if year:
-                            # Format: YYYY-MM-DD (like Results page)
-                            if day and month:
-                                last_release_date = f"{year}-{month:02d}-{day:02d}"
-                            elif month:
-                                last_release_date = f"{year}-{month:02d}-01"
-                            else:
-                                last_release_date = f"{year}-01-01"
+                        if releases_items and len(releases_items) > 0:
+                            date_info = releases_items[0].get('date', {})
+                            
+                            if date_info:
+                                year = date_info.get('year')
+                                month = date_info.get('month')
+                                day = date_info.get('day')
+                                
+                                if year:
+                                    # Format: YYYY-MM-DD (like Results page)
+                                    if day and month:
+                                        last_release_date = f"{year}-{month:02d}-{day:02d}"
+                                    elif month:
+                                        last_release_date = f"{year}-{month:02d}-01"
+                                    else:
+                                        last_release_date = f"{year}-01-01"
+                    
+                    # Method 2: Fallback to latest if singles failed
+                    if not last_release_date:
+                        latest = discography.get('latest', {})
+                        date_info = latest.get('date', {})
+                        
+                        if date_info:
+                            year = date_info.get('year')
+                            month = date_info.get('month')
+                            day = date_info.get('day')
+                            
+                            if year:
+                                if day and month:
+                                    last_release_date = f"{year}-{month:02d}-{day:02d}"
+                                elif month:
+                                    last_release_date = f"{year}-{month:02d}-01"
+                                else:
+                                    last_release_date = f"{year}-01-01"
                     
                     logger.info(f"✅ RapidAPI success for {artist_id}: {listeners} listeners")
                     
