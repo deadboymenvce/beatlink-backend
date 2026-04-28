@@ -18,6 +18,7 @@ class YouTubeService:
     def __init__(self):
         self.temp_dir = tempfile.gettempdir()
         self.api_key = os.getenv("YOUTUBE_API_KEY")
+        # Use dedicated RapidAPI key for YouTube Downloader (10K/month - Compte A)
         self.rapidapi_key = os.getenv("RAPIDAPI_KEY")
         self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "youtube-mp3-audio-video-downloader.p.rapidapi.com")
         
@@ -27,7 +28,7 @@ class YouTubeService:
             logger.warning("⚠️ YOUTUBE_API_KEY not set")
         
         if self.rapidapi_key:
-            logger.info("✅ RAPIDAPI_KEY configured")
+            logger.info("✅ RAPIDAPI_KEY configured (YouTube Downloader)")
         else:
             logger.error("❌ RAPIDAPI_KEY not set")
         
