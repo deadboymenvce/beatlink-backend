@@ -13,7 +13,8 @@ class SpotifyService:
     def __init__(self):
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-        self.rapidapi_key = os.getenv("RAPIDAPI_KEY")
+        # Use dedicated RapidAPI key for Spotify Scraper (500/month - Compte B)
+        self.rapidapi_key = os.getenv("RAPIDAPI_KEY_SPOTIFY")
         self.token = None
         self.token_expires_at = 0
         self.cache = {}  # Cache format: {artist_id: {'data': {...}, 'timestamp': 123}}
@@ -24,9 +25,9 @@ class SpotifyService:
             logger.error("❌ Spotify credentials missing")
         
         if self.rapidapi_key:
-            logger.info("✅ RapidAPI key configured")
+            logger.info("✅ RAPIDAPI_KEY_SPOTIFY configured (Spotify Scraper)")
         else:
-            logger.warning("⚠️ RapidAPI key missing - artist data will use fallback values")
+            logger.warning("⚠️ RAPIDAPI_KEY_SPOTIFY missing - artist data will use fallback values")
 
     def _get_token(self):
         """Get Spotify API access token (client credentials flow)"""
@@ -162,7 +163,7 @@ class SpotifyService:
             }
         """
         if not self.rapidapi_key:
-            logger.warning(f"⚠️ No RapidAPI key - returning fallback for {artist_id}")
+            logger.warning(f"⚠️ No RAPIDAPI_KEY_SPOTIFY - returning fallback for {artist_id}")
             return {'listeners': 0, 'city': None, 'instagram_url': None}
         
         url = f"https://real-time-spotify-data-scraper.p.rapidapi.com/artist_overview/?id={artist_id}"
