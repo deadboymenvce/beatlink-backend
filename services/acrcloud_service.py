@@ -5,13 +5,13 @@ import hashlib
 import hmac
 import time
 import requests
-
+ 
 logger = logging.getLogger(__name__)
-
-
+ 
+ 
 class ACRCloudService:
     """Service to identify audio using ACR Cloud fingerprinting"""
-
+ 
     def __init__(self):
         self.host = os.getenv("ACR_HOST")
         self.access_key = os.getenv("ACR_ACCESS_KEY")
@@ -21,7 +21,7 @@ class ACRCloudService:
             logger.info("✅ ACR Cloud credentials configured")
         else:
             logger.error("❌ ACR Cloud credentials missing")
-
+ 
     def _generate_signature(self, string_to_sign):
         """Generate HMAC signature for ACR Cloud API"""
         return base64.b64encode(
@@ -31,13 +31,13 @@ class ACRCloudService:
                 digestmod=hashlib.sha1
             ).digest()
         ).decode('utf-8')
-
+ 
     def identify_audio(self, audio_file_path):
         """
         Identify audio file using ACR Cloud
         
         Returns:
-        List of matched songs with complete data
+        List of matched songs with complete data (score >= 60%)
         [
             {
                 'title': 'Song Title',
@@ -126,9 +126,17 @@ class ACRCloudService:
             # Format and FILTER results
             matches = []
             skipped = 0
+            low_score_skipped = 0
             
             for music in music_list:
                 score = music.get('score', 0)
+                
+                # FILTER: Score must be >= 60
+                if score < 60:
+                    logger.warning(f"⚠️ Skipping result with low score: {score:.1f}%")
+                    skipped += 1
+                    low_score_skipped += 1
+                    continue
                 
                 # GET TITLE with validation
                 title = music.get('title', '').strip()
@@ -175,9 +183,9 @@ class ACRCloudService:
                 matches.append(match)
             
             if skipped > 0:
-                logger.info(f"⚠️ Skipped {skipped} invalid results")
+                logger.info(f"⚠️ Skipped {skipped} invalid results ({low_score_skipped} due to low score)")
             
-            logger.info(f"✅ Found {len(matches)} valid matches")
+            logger.info(f"✅ Found {len(matches)} valid matches (score >= 60%)")
             
             return matches
             
@@ -188,3 +196,4 @@ class ACRCloudService:
         except Exception as e:
             logger.error(f"❌ ACR Cloud error: {str(e)}", exc_info=True)
             return []
+ 
