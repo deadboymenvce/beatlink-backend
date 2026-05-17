@@ -5,6 +5,7 @@ from flask_cors import CORS
 from services.youtube_service import YouTubeService
 from services.acrcloud_service import ACRCloudService
 from services.spotify_service import SpotifyService
+from services.brave_search_service import BraveSearchService
  
 # Configure logging
 logging.basicConfig(
@@ -21,6 +22,7 @@ CORS(app)
 youtube_service = YouTubeService()
 acrcloud_service = ACRCloudService()
 spotify_service = SpotifyService()
+brave_search_service = BraveSearchService()
  
  
 @app.route('/health', methods=['GET'])
@@ -147,6 +149,177 @@ def scan_beat():
             'error': 'internal_error',
             'message': f'Internal server error: {str(e)}'
         }), 500
+
+
+@app.route('/reveal-instagram', methods=['POST'])
+def reveal_instagram():
+    """
+    Endpoint to reveal Instagram contact for an artist
+    
+    This endpoint is called when user clicks "Reveal Contacts" on an artist
+    with empty Instagram field.
+    
+    Expected JSON body:
+    {
+        "artist_name": "Drake"
+    }
+    
+    Returns:
+    {
+        "success": true/false,
+        "artist_name": "Drake",
+        "instagram_url": "https://instagram.com/champagnepapi" or null,
+        "source": "brave_search" or "cache"
+    }
+    """
+    try:
+        # Get artist name from request
+        data = request.get_json()
+        
+        if not data or 'artist_name' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'missing_artist_name',
+                'message': 'artist_name is required in request body'
+            }), 400
+        
+        artist_name = data['artist_name']
+        
+        if not artist_name or not artist_name.strip():
+            return jsonify({
+                'success': False,
+                'error': 'empty_artist_name',
+                'message': 'artist_name cannot be empty'
+            }), 400
+        
+        logger.info(f"🔍 Revealing Instagram for: {artist_name}")
+        
+        # Check if artist is in cache
+        is_cached = artist_name in brave_search_service.cache
+        
+        # Search Instagram via Brave Search
+        instagram_url = brave_search_service.search_instagram(artist_name)
+        
+        # Determine source
+        source = "cache" if is_cached else "brave_search"
+        
+        # Return result
+        if instagram_url:
+            logger.info(f"✅ Found Instagram for '{artist_name}': {instagram_url}")
+            return jsonify({
+                'success': True,
+                'artist_name': artist_name,
+                'instagram_url': instagram_url,
+                'source': source
+            }), 200
+        else:
+            logger.info(f"ℹ️ No Instagram found for '{artist_name}'")
+            return jsonify({
+                'success': True,
+                'artist_name': artist_name,
+                'instagram_url': None,
+                'source': source,
+                'message': 'No Instagram profile found'
+            }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in reveal_instagram: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'internal_error',
+            'message': f'Internal server error: {str(e)}'
+        }), 500
+
+
+@app.route('/reveal-instagram/batch', methods=['POST'])
+def reveal_instagram_batch():
+    """
+    Batch endpoint to reveal Instagram for multiple artists
+    
+    Expected JSON body:
+    {
+        "artists": ["Drake", "Travis Scott", "Lil Baby"]
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "results": [
+            {
+                "artist_name": "Drake",
+                "instagram_url": "https://instagram.com/champagnepapi",
+                "source": "brave_search"
+            },
+            ...
+        ]
+    }
+    
+    Note: Respects rate limiting (1 req/sec), so this endpoint may take time
+    """
+    try:
+        # Get artist names from request
+        data = request.get_json()
+        
+        if not data or 'artists' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'missing_artists',
+                'message': 'artists array is required in request body'
+            }), 400
+        
+        artist_names = data['artists']
+        
+        if not isinstance(artist_names, list):
+            return jsonify({
+                'success': False,
+                'error': 'invalid_artists',
+                'message': 'artists must be an array of strings'
+            }), 400
+        
+        if len(artist_names) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'empty_artists',
+                'message': 'artists array cannot be empty'
+            }), 400
+        
+        logger.info(f"🔍 Batch revealing Instagram for {len(artist_names)} artists")
+        
+        # Search all artists
+        instagram_urls = brave_search_service.batch_search_instagrams(artist_names)
+        
+        # Build results
+        results = []
+        for artist_name, instagram_url in zip(artist_names, instagram_urls):
+            is_cached = artist_name in brave_search_service.cache
+            results.append({
+                'artist_name': artist_name,
+                'instagram_url': instagram_url,
+                'source': 'cache' if is_cached else 'brave_search'
+            })
+        
+        # Stats
+        found_count = sum(1 for r in results if r['instagram_url'] is not None)
+        
+        logger.info(f"✅ Batch reveal complete: {found_count}/{len(artist_names)} found")
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'stats': {
+                'total': len(artist_names),
+                'found': found_count,
+                'not_found': len(artist_names) - found_count
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in batch reveal: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'internal_error',
+            'message': f'Internal server error: {str(e)}'
+        }), 500
  
  
 if __name__ == '__main__':
@@ -156,5 +329,6 @@ if __name__ == '__main__':
     logger.info(f"✅ YOUTUBE_API_KEY: {'Set' if os.getenv('YOUTUBE_API_KEY') else 'Missing'}")
     logger.info(f"✅ ACR Cloud credentials: {'Set' if all([os.getenv('ACR_HOST'), os.getenv('ACR_ACCESS_KEY'), os.getenv('ACR_SECRET_KEY')]) else 'Missing'}")
     logger.info(f"✅ Spotify credentials: {'Set' if all([os.getenv('SPOTIFY_CLIENT_ID'), os.getenv('SPOTIFY_CLIENT_SECRET')]) else 'Missing'}")
+    logger.info(f"✅ BRAVE_SEARCH_API_KEY: {'Set' if os.getenv('BRAVE_SEARCH_API_KEY') else 'Missing'}")
     
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
