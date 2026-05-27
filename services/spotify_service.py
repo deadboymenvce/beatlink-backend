@@ -180,64 +180,62 @@ class SpotifyService:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    
+
                     # Parse listeners (REQUIRED - never None)
-                    artist_data = data.get('data', {}).get('artist', {})
-                    stats = artist_data.get('stats', {})
-                    listeners = stats.get('monthlyListeners', 0)
-                    
+                    artist_data = (data.get('data') or {}).get('artist') or {}
+                    stats = artist_data.get('stats') or {}
+                    listeners = stats.get('monthlyListeners') or 0
+
                     # Ensure listeners is int
                     if not isinstance(listeners, int):
                         listeners = 0
-                    
+
                     # Parse city (OPTIONAL)
-                    top_cities = stats.get('topCities', {}).get('items', [])
+                    top_cities = (stats.get('topCities') or {}).get('items') or []
                     city = None
-                    if top_cities and len(top_cities) > 0:
+                    if top_cities:
                         city_name = top_cities[0].get('city', '')
                         country = top_cities[0].get('country', '')
                         if city_name and country:
                             city = f"{city_name}, {country}"
-                    
+
                     # Parse Instagram and Twitter (OPTIONAL)
-                    profile = artist_data.get('profile', {})
-                    external_links = profile.get('externalLinks', {}).get('items', [])
+                    profile = artist_data.get('profile') or {}
+                    external_links = (profile.get('externalLinks') or {}).get('items') or []
                     instagram_url = None
                     twitter_url = None
-                    
+
                     for link in external_links:
                         link_name = link.get('name')
                         if link_name == 'INSTAGRAM':
                             instagram_url = link.get('url')
                         elif link_name == 'TWITTER':
                             twitter_url = link.get('url')
-                        
+
                         # Stop early if we found both
                         if instagram_url and twitter_url:
                             break
-                    
+
                     # Parse last release date (OPTIONAL)
                     # Try to get complete date from singles (has day/month/year)
                     # Fallback to latest if singles not available (may only have year)
-                    discography = artist_data.get('discography', {})
+                    discography = artist_data.get('discography') or {}
                     last_release_date = None
-                    
+
                     # Method 1: Extract from singles (most complete)
-                    singles = discography.get('singles', {})
-                    singles_items = singles.get('items', [])
-                    
-                    if singles_items and len(singles_items) > 0:
-                        releases = singles_items[0].get('releases', {})
-                        releases_items = releases.get('items', [])
-                        
-                        if releases_items and len(releases_items) > 0:
-                            date_info = releases_items[0].get('date', {})
-                            
+                    singles_items = (discography.get('singles') or {}).get('items') or []
+
+                    if singles_items:
+                        releases_items = (singles_items[0].get('releases') or {}).get('items') or []
+
+                        if releases_items:
+                            date_info = releases_items[0].get('date') or {}
+
                             if date_info:
                                 year = date_info.get('year')
                                 month = date_info.get('month')
                                 day = date_info.get('day')
-                                
+
                                 if year:
                                     # Format: YYYY-MM-DD (like Results page)
                                     if day and month:
@@ -246,17 +244,16 @@ class SpotifyService:
                                         last_release_date = f"{year}-{month:02d}-01"
                                     else:
                                         last_release_date = f"{year}-01-01"
-                    
+
                     # Method 2: Fallback to latest if singles failed
                     if not last_release_date:
-                        latest = discography.get('latest', {})
-                        date_info = latest.get('date', {})
-                        
+                        date_info = (discography.get('latest') or {}).get('date') or {}
+
                         if date_info:
                             year = date_info.get('year')
                             month = date_info.get('month')
                             day = date_info.get('day')
-                            
+
                             if year:
                                 if day and month:
                                     last_release_date = f"{year}-{month:02d}-{day:02d}"
@@ -264,11 +261,11 @@ class SpotifyService:
                                     last_release_date = f"{year}-{month:02d}-01"
                                 else:
                                     last_release_date = f"{year}-01-01"
-                    
+
                     # Parse artist profile image (OPTIONAL)
-                    visuals = artist_data.get('visuals', {})
-                    avatar_image = visuals.get('avatarImage', {})
-                    sources = avatar_image.get('sources', [])
+                    visuals = artist_data.get('visuals') or {}
+                    avatar_image = visuals.get('avatarImage') or {}
+                    sources = avatar_image.get('sources') or []
                     artist_image = None
                     
                     if sources and len(sources) > 0:
