@@ -121,13 +121,13 @@ def scan_beat():
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
         
         # FILTER: Keep only songs with complete Spotify data
-        # Ghost artist rule: only drop when RapidAPI *succeeded* and found an empty discography.
-        # If RapidAPI failed (401, timeout…), we give the benefit of the doubt and keep the result.
+        # Ghost artist rule: only drop when RapidAPI *succeeded* and confirmed 0 published tracks.
+        # If RapidAPI failed (401, timeout…), has_discography defaults to True (benefit of doubt).
         filtered_songs = [
             song for song in enriched_songs
             if song.get('spotify_url')
             and song.get('cover_url')
-            and not (song.get('_rapidapi_ok') is True and song.get('last_release_date') is None)
+            and song.get('has_discography', True)
         ]
         
         logger.info(f"🔍 Filtered from {len(enriched_songs)} to {len(filtered_songs)} complete results")

@@ -267,12 +267,17 @@ class SpotifyService:
                     avatar_image = visuals.get('avatarImage') or {}
                     sources = avatar_image.get('sources') or []
                     artist_image = None
-                    
-                    if sources and len(sources) > 0:
-                        # Take first source (640x640, highest quality)
+
+                    if sources:
                         artist_image = sources[0].get('url', '')
-                    
-                    logger.info(f"✅ RapidAPI success for {artist_id}: {listeners} listeners")
+
+                    # Detect ghost artist: no singles, no albums, no compilations
+                    n_singles = (discography.get('singles') or {}).get('totalCount') or 0
+                    n_albums = (discography.get('albums') or {}).get('totalCount') or 0
+                    n_compilations = (discography.get('compilations') or {}).get('totalCount') or 0
+                    has_discography = (n_singles + n_albums + n_compilations) > 0
+
+                    logger.info(f"✅ RapidAPI success for {artist_id}: {listeners} listeners, discography={has_discography}")
 
                     return {
                         'listeners': listeners,
@@ -281,6 +286,7 @@ class SpotifyService:
                         'twitter_url': twitter_url,
                         'last_release_date': last_release_date,
                         'artist_image': artist_image,
+                        'has_discography': has_discography,
                         '_rapidapi_ok': True
                     }
                 
@@ -461,6 +467,7 @@ class SpotifyService:
                         track['twitter_url'] = scraped.get('twitter_url')
                         track['last_release_date'] = scraped.get('last_release_date')
                         track['artist_image'] = scraped.get('artist_image')
+                        track['has_discography'] = scraped.get('has_discography', True)
                         track['_rapidapi_ok'] = scraped.get('_rapidapi_ok', False)
                         scrape_index += 1
                     else:
