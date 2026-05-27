@@ -120,10 +120,13 @@ def scan_beat():
         
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
         
-        # FILTER: Keep only songs with complete Spotify data (spotify_url AND cover_url)
+        # FILTER: Keep only songs with complete Spotify data AND a real artist profile
+        # Exclude ghost artists: listeners == 0 AND no artist_image means empty/fake Spotify account
         filtered_songs = [
-            song for song in enriched_songs 
-            if song.get('spotify_url') and song.get('cover_url')
+            song for song in enriched_songs
+            if song.get('spotify_url')
+            and song.get('cover_url')
+            and not (song.get('listeners', 0) == 0 and song.get('artist_image') is None)
         ]
         
         logger.info(f"🔍 Filtered from {len(enriched_songs)} to {len(filtered_songs)} complete results")
