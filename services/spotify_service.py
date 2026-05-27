@@ -273,14 +273,15 @@ class SpotifyService:
                         artist_image = sources[0].get('url', '')
                     
                     logger.info(f"✅ RapidAPI success for {artist_id}: {listeners} listeners")
-                    
+
                     return {
                         'listeners': listeners,
                         'city': city,
                         'instagram_url': instagram_url,
                         'twitter_url': twitter_url,
                         'last_release_date': last_release_date,
-                        'artist_image': artist_image
+                        'artist_image': artist_image,
+                        '_rapidapi_ok': True
                     }
                 
                 elif response.status_code == 429:
@@ -320,68 +321,17 @@ class SpotifyService:
                 logger.error(f"❌ RapidAPI exception for {artist_id}: {str(e)}")
                 break
         
-        # All RapidAPI retries exhausted — fall back to Spotify Official API
-        logger.warning(f"⚠️ RapidAPI unavailable for {artist_id}, falling back to Spotify Official API")
-        return self._get_artist_spotify_fallback(artist_id)
-
-    def _get_artist_spotify_fallback(self, artist_id):
-        """
-        Fallback when RapidAPI is unavailable: fetch artist image + last release
-        date from the Spotify Official API (free, no extra rate limits).
-
-        Returns the same shape as _get_artist_data_rapidapi so callers are
-        unaffected, but listeners/city/instagram are left at their zero values.
-        Ghost artists (no releases on Spotify) still return last_release_date=None
-        so the existing filter in app.py continues to work correctly.
-        """
-        token = self._get_token()
-        artist_image = None
-        last_release_date = None
-
-        if not token:
-            logger.warning(f"⚠️ Spotify token unavailable for fallback on {artist_id}")
-        else:
-            try:
-                # Artist profile → image
-                r = requests.get(
-                    f"https://api.spotify.com/v1/artists/{artist_id}",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=10
-                )
-                if r.status_code == 200:
-                    images = r.json().get('images') or []
-                    if images:
-                        artist_image = images[0].get('url')
-            except Exception as e:
-                logger.warning(f"⚠️ Spotify artist fallback error for {artist_id}: {e}")
-
-            try:
-                # Most recent single or album → last_release_date
-                r = requests.get(
-                    f"https://api.spotify.com/v1/artists/{artist_id}/albums",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"include_groups": "single,album", "limit": 1, "market": "US"},
-                    timeout=10
-                )
-                if r.status_code == 200:
-                    items = r.json().get('items') or []
-                    if items:
-                        last_release_date = items[0].get('release_date')
-            except Exception as e:
-                logger.warning(f"⚠️ Spotify albums fallback error for {artist_id}: {e}")
-
-        if last_release_date:
-            logger.info(f"✅ Spotify fallback success for {artist_id}: last release {last_release_date}")
-        else:
-            logger.info(f"ℹ️ Spotify fallback: no releases found for {artist_id} (ghost artist)")
-
+        # All RapidAPI retries exhausted — return empty values flagged as failed
+        # _rapidapi_ok=False means the filter in app.py will NOT treat this as a confirmed ghost artist
+        logger.warning(f"⚠️ RapidAPI unavailable for {artist_id}, returning partial result")
         return {
             'listeners': 0,
             'city': None,
             'instagram_url': None,
             'twitter_url': None,
-            'last_release_date': last_release_date,
-            'artist_image': artist_image
+            'last_release_date': None,
+            'artist_image': None,
+            '_rapidapi_ok': False
         }
 
     def _get_artist_data_with_cache(self, artist_id):
@@ -511,6 +461,7 @@ class SpotifyService:
                         track['twitter_url'] = scraped.get('twitter_url')
                         track['last_release_date'] = scraped.get('last_release_date')
                         track['artist_image'] = scraped.get('artist_image')
+                        track['_rapidapi_ok'] = scraped.get('_rapidapi_ok', False)
                         scrape_index += 1
                     else:
                         # Fallback if index mismatch
