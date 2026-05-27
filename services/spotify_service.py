@@ -402,7 +402,9 @@ class SpotifyService:
             spotify_id = match.get('spotify_id', '')
             
             if not spotify_id:
-                # No Spotify ID, return basic info with fallback values
+                # ACR Cloud matched this track via a non-Spotify database (Gracenote, Deezer…)
+                # Without a Spotify track ID we cannot get artist data or cover art → will be filtered
+                logger.warning(f"⚠️ No Spotify ID for '{match['title']}' by {match['artists']} — will be dropped (ACR match without Spotify link)")
                 enriched.append({
                     'title': match['title'],
                     'artists': match['artists'],
