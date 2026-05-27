@@ -297,6 +297,15 @@ class SpotifyService:
                         logger.error(f"❌ RapidAPI rate limit exhausted for {artist_id}")
                         break
                 
+                elif response.status_code == 401:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️ RapidAPI 401 for {artist_id}, retrying in 2s... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(2)
+                        continue
+                    else:
+                        logger.error(f"❌ RapidAPI error 401 for {artist_id}")
+                        break
+
                 else:
                     logger.error(f"❌ RapidAPI error {response.status_code} for {artist_id}")
                     break
@@ -424,9 +433,11 @@ class SpotifyService:
             logger.info(f"🔍 Fetching {len(artist_ids_to_fetch)} artist(s) data...")
             
             scraped_data = []
-            for artist_id in artist_ids_to_fetch:
+            for i, artist_id in enumerate(artist_ids_to_fetch):
                 data = self._get_artist_data_with_cache(artist_id)
                 scraped_data.append(data)
+                if i < len(artist_ids_to_fetch) - 1:
+                    time.sleep(1.0)
             
             # Step 3: Merge scraped data with enriched tracks
             scrape_index = 0
