@@ -37,7 +37,7 @@ class ACRCloudService:
         Identify audio file using ACR Cloud
         
         Returns:
-        List of matched songs with complete data (score >= 60%)
+        List of matched songs with complete data (score >= 55%)
         [
             {
                 'title': 'Song Title',
@@ -131,8 +131,8 @@ class ACRCloudService:
             for music in music_list:
                 score = music.get('score', 0)
                 
-                # FILTER: Score must be >= 60
-                if score < 60:
+                # FILTER: Score must be >= 55
+                if score < 55:
                     logger.warning(f"⚠️ Skipping result with low score: {score:.1f}%")
                     skipped += 1
                     low_score_skipped += 1
@@ -185,7 +185,7 @@ class ACRCloudService:
             if skipped > 0:
                 logger.info(f"⚠️ Skipped {skipped} invalid results ({low_score_skipped} due to low score)")
             
-            logger.info(f"✅ Found {len(matches)} valid matches (score >= 60%)")
+            logger.info(f"✅ Found {len(matches)} valid matches (score >= 55%)")
             
             return matches
             
