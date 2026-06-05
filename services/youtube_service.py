@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import tempfile
 import subprocess
@@ -12,15 +13,17 @@ class YouTubeService:
     """
     YouTube service using:
     1. YouTube Data API v3 for metadata
-    2. RapidAPI (YouTube MP3 Audio Video Downloader) for M4A download
+    2. RapidAPI (youtube-mp3-2025) for M4A download
     """
 
     def __init__(self):
         self.temp_dir = tempfile.gettempdir()
         self.api_key = os.getenv("YOUTUBE_API_KEY")
-        # Use dedicated RapidAPI key for YouTube Downloader (10K/month - Compte A)
+        # RapidAPI key (account-wide). Set RAPIDAPI_KEY on Render.
         self.rapidapi_key = os.getenv("RAPIDAPI_KEY")
-        self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "youtube-mp3-audio-video-downloader.p.rapidapi.com")
+        # youtube-mp3-2025 API — returns JSON with a CDN download link for the M4A.
+        # Hardcoded so a stale RAPIDAPI_HOST env can't point at the old endpoint.
+        self.rapidapi_host = "youtube-mp3-2025.p.rapidapi.com"
         
         if self.api_key:
             logger.info("✅ YOUTUBE_API_KEY configured")
@@ -145,15 +148,14 @@ class YouTubeService:
 
     def download_audio(self, youtube_url):
         """
-        Download audio using RapidAPI (YouTube MP3 Audio Video Downloader)
-        
-        This API:
-        - Downloads M4A format (faster than MP3)
-        - Returns the file directly as binary stream (not JSON)
-        - Cost: ~0.000619$ per request (16x cheaper than Apify)
-        - Speed: ~30 seconds (2x faster than Apify)
-        
-        After download, we extract 30 seconds with FFmpeg for ACR Cloud
+        Download audio using RapidAPI (youtube-mp3-2025)
+
+        Two-step API:
+        1. GET /v1/social/youtube/audio?id=<id>&quality=128kbps&ext=m4a
+           → JSON containing a CDN `linkDownload`
+        2. GET that link → the binary M4A file
+
+        After download, we extract 30 seconds with FFmpeg for ACR Cloud.
         """
         video_id = self._extract_video_id(youtube_url)
         
@@ -171,60 +173,64 @@ class YouTubeService:
                 os.remove(f_raw)
         
         try:
-            logger.info(f"🎵 Downloading audio for {video_id} via RapidAPI...")
-            
-            # Build API endpoint
-            # The API uses video ID directly in the URL path
-            api_url = f"https://{self.rapidapi_host}/download-m4a/{video_id}"
-            
+            logger.info(f"🎵 Downloading audio for {video_id} via RapidAPI (youtube-mp3-2025)...")
+
             headers = {
-                'X-RapidAPI-Key': self.rapidapi_key,
-                'X-RapidAPI-Host': self.rapidapi_host
+                'x-rapidapi-key': self.rapidapi_key,
+                'x-rapidapi-host': self.rapidapi_host,
             }
-            
-            logger.info(f"🚀 Calling RapidAPI (may take ~30 seconds)...")
-            logger.info(f"📤 Endpoint: {api_url}")
-            
-            # Call RapidAPI
-            # Timeout: 60s (observed time is ~30s, so this gives margin)
-            response = requests.get(
-                api_url,
-                headers=headers,
-                timeout=(10, 120),
-                stream=True  # Important: stream the binary response
-            )
-            
-            logger.info(f"📥 RapidAPI response status: {response.status_code}")
-            
-            if response.status_code != 200:
-                logger.error(f"❌ RapidAPI error: {response.status_code}")
-                if response.status_code == 522:
-                    logger.error("Error 522: Connection timed out (server issue)")
-                elif response.status_code == 524:
-                    logger.error("Error 524: Timeout occurred (server took too long)")
-                else:
-                    logger.error(f"Response text: {response.text[:500]}")
+
+            # Step 1 — ask the API for the audio links (returns JSON, not the file)
+            info_url = f"https://{self.rapidapi_host}/v1/social/youtube/audio"
+            params = {'id': video_id, 'quality': '128kbps', 'ext': 'm4a'}
+
+            logger.info(f"🚀 Requesting audio link: {info_url}?id={video_id}")
+            info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
+            logger.info(f"📥 API response status: {info_resp.status_code}")
+
+            if info_resp.status_code != 200:
+                logger.error(f"❌ RapidAPI error: {info_resp.status_code} - {info_resp.text[:300]}")
                 return None
-            
-            # Check content type
-            content_type = response.headers.get('content-type', '')
-            logger.info(f"📦 Content-Type: {content_type}")
-            
-            if 'octet-stream' not in content_type and 'audio' not in content_type:
-                logger.error(f"❌ Unexpected content type: {content_type}")
+
+            data = info_resp.json()
+            if data.get('error'):
+                logger.error(f"❌ API returned error: {data}")
                 return None
-            
-            # Save M4A file directly from stream
-            # The response IS the file, not a JSON with a URL
+
+            download_url = data.get('linkDownload') or data.get('linkStream')
+            if not download_url:
+                logger.error(f"❌ No download link in API response (keys: {list(data.keys())})")
+                return None
+
+            # Step 2 — download the binary M4A from the CDN link. The CDN converts
+            # on demand, so retry a few times in case it isn't ready on the first hit.
             raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.m4a')
-            
-            logger.info(f"⬇️ Saving M4A file from stream...")
-            
+            logger.info("⬇️ Downloading M4A from CDN...")
+
+            file_resp = None
+            for attempt in range(1, 4):
+                try:
+                    r = requests.get(download_url, timeout=(10, 120), stream=True)
+                    ctype = r.headers.get('content-type', '')
+                    if r.status_code == 200 and ('audio' in ctype or 'mp4' in ctype or 'octet-stream' in ctype):
+                        file_resp = r
+                        break
+                    logger.warning(f"⚠️ CDN not ready (attempt {attempt}): status={r.status_code}, type={ctype}")
+                    r.close()
+                    time.sleep(3)
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"⚠️ CDN download attempt {attempt} failed: {e}")
+                    time.sleep(3)
+
+            if not file_resp:
+                logger.error("❌ Could not download the M4A from CDN after retries")
+                return None
+
             with open(raw_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in file_resp.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            
+
             file_size_kb = os.path.getsize(raw_path) // 1024
             logger.info(f"✅ M4A downloaded: {raw_path} ({file_size_kb} KB)")
             
