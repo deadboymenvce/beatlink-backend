@@ -180,51 +180,75 @@ class YouTubeService:
                 'x-rapidapi-host': self.rapidapi_host,
             }
 
-            # Step 1 — ask the API for the audio links (returns JSON, not the file)
+            # The youtube-mp3-2025 API transcodes ON DEMAND: it hands back a CDN link that
+            # 500s ("not ready") until the file is converted. So we POLL — re-requesting a
+            # fresh link a few times and patiently retrying the CDN with backoff — instead of
+            # hitting the same link 3×/3s and giving up at ~40s.
             info_url = f"https://{self.rapidapi_host}/v1/social/youtube/audio"
             params = {'id': video_id, 'quality': '128kbps', 'ext': 'm4a'}
-
-            logger.info(f"🚀 Requesting audio link: {info_url}?id={video_id}")
-            info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
-            logger.info(f"📥 API response status: {info_resp.status_code}")
-
-            if info_resp.status_code != 200:
-                logger.error(f"❌ RapidAPI error: {info_resp.status_code} - {info_resp.text[:300]}")
-                return None
-
-            data = info_resp.json()
-            if data.get('error'):
-                logger.error(f"❌ API returned error: {data}")
-                return None
-
-            download_url = data.get('linkDownload') or data.get('linkStream')
-            if not download_url:
-                logger.error(f"❌ No download link in API response (keys: {list(data.keys())})")
-                return None
-
-            # Step 2 — download the binary M4A from the CDN link. The CDN converts
-            # on demand, so retry a few times in case it isn't ready on the first hit.
             raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.m4a')
-            logger.info("⬇️ Downloading M4A from CDN...")
 
             file_resp = None
-            for attempt in range(1, 4):
+            download_url = None
+            api_calls = 0
+            last_cdn_body = ''
+            deadline = time.time() + 120  # overall budget for the conversion to finish
+
+            while time.time() < deadline and file_resp is None:
+                # (Re)fetch a link when we don't have one. Capped to spare RapidAPI quota:
+                # after 4 calls we keep polling the last link until the deadline.
+                if download_url is None and api_calls < 4:
+                    api_calls += 1
+                    try:
+                        logger.info(f"🚀 Requesting audio link (call {api_calls}): id={video_id}")
+                        info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
+                    except requests.exceptions.RequestException as e:
+                        logger.warning(f"⚠️ API call {api_calls} failed: {e}")
+                        time.sleep(5)
+                        continue
+                    if info_resp.status_code != 200:
+                        logger.error(f"❌ RapidAPI error: {info_resp.status_code} - {info_resp.text[:300]}")
+                        time.sleep(5)
+                        continue
+                    data = info_resp.json()
+                    if data.get('error'):
+                        logger.error(f"❌ API returned error: {data}")
+                        return None
+                    logger.info(f"🔎 API payload (call {api_calls}): status={data.get('status')} keys={list(data.keys())}")
+                    download_url = data.get('linkDownload') or data.get('linkStream')
+                    if not download_url:
+                        logger.info("⏳ Link not ready yet — converting, will re-request…")
+                        time.sleep(7)
+                        continue
+
+                # Try the CDN link.
                 try:
                     r = requests.get(download_url, timeout=(10, 120), stream=True)
                     ctype = r.headers.get('content-type', '')
                     if r.status_code == 200 and ('audio' in ctype or 'mp4' in ctype or 'octet-stream' in ctype):
                         file_resp = r
                         break
-                    logger.warning(f"⚠️ CDN not ready (attempt {attempt}): status={r.status_code}, type={ctype}")
+                    try:
+                        last_cdn_body = r.text[:200]
+                    except Exception:
+                        last_cdn_body = ''
+                    logger.warning(f"⚠️ CDN not ready: status={r.status_code}, type={ctype}, body={last_cdn_body}")
                     r.close()
-                    time.sleep(3)
                 except requests.exceptions.RequestException as e:
-                    logger.warning(f"⚠️ CDN download attempt {attempt} failed: {e}")
-                    time.sleep(3)
+                    logger.warning(f"⚠️ CDN download failed: {e}")
+
+                # Still converting → drop this link to grab a fresh one (until the API cap),
+                # then back off before the next attempt.
+                if api_calls < 4:
+                    download_url = None
+                time.sleep(6)
 
             if not file_resp:
-                logger.error("❌ Could not download the M4A from CDN after retries")
+                logger.error(f"❌ Could not download the M4A within {int(time.time() - (deadline - 120))}s "
+                             f"(last CDN body: {last_cdn_body or 'n/a'})")
                 return None
+
+            logger.info("⬇️ CDN ready — downloading M4A...")
 
             with open(raw_path, 'wb') as f:
                 for chunk in file_resp.iter_content(chunk_size=8192):
