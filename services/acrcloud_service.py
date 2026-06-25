@@ -171,6 +171,14 @@ class ACRCloudService:
                 spotify_data = external_metadata.get('spotify', {})
                 spotify_track = spotify_data.get('track', {})
                 spotify_id = spotify_track.get('id', '')
+
+                # DEBUG: which platforms did ACRCloud actually return for this match?
+                # Lets us confirm whether dropped (no-Spotify) tracks carry deezer/youtube IDs
+                # (cross-platform, just unlinked to Spotify) or no external links at all.
+                logger.info(
+                    f"🔎 ext_metadata '{title}' by {artist_names}: "
+                    f"platforms={list(external_metadata.keys())} spotify={'YES' if spotify_id else 'NO'}"
+                )
                 
                 # Create match object
                 match = {
