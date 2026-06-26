@@ -131,8 +131,8 @@ class ACRCloudService:
             for music in music_list:
                 score = music.get('score', 0)
                 
-                # FILTER: Score must be >= 55
-                if score < 55:
+                # FILTER: Score must be >= 40
+                if score < 40:
                     logger.warning(f"⚠️ Skipping result with low score: {score:.1f}%")
                     skipped += 1
                     low_score_skipped += 1
@@ -193,7 +193,7 @@ class ACRCloudService:
             if skipped > 0:
                 logger.info(f"⚠️ Skipped {skipped} invalid results ({low_score_skipped} due to low score)")
             
-            logger.info(f"✅ Found {len(matches)} valid matches (score >= 55%)")
+            logger.info(f"✅ Found {len(matches)} valid matches (score >= 40%)")
             
             return matches
             
