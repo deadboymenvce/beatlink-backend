@@ -371,13 +371,16 @@ class SpotifyService:
         # Cache miss or expired - fetch from RapidAPI
         logger.info(f"🌐 Fetching {artist_id} from RapidAPI...")
         data = self._get_artist_data_rapidapi(artist_id)
-        
-        # Store in cache
-        self.cache[artist_id] = {
-            'data': data,
-            'timestamp': time.time()
-        }
-        
+
+        # Only cache real successes. Caching a failure (RapidAPI down/rate-limited)
+        # would serve empty artist data for 24h on every retry, even once RapidAPI
+        # recovers seconds later.
+        if data.get('_rapidapi_ok', False):
+            self.cache[artist_id] = {
+                'data': data,
+                'timestamp': time.time()
+            }
+
         return data
 
     def enrich_tracks(self, matches):
