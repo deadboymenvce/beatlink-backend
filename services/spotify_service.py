@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import requests
 import base64
@@ -15,19 +16,26 @@ class SpotifyService:
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         # Use dedicated RapidAPI key for Spotify Scraper (500/month - Compte B)
         self.rapidapi_key = os.getenv("RAPIDAPI_KEY_SPOTIFY")
+        # Instagram fallback when Spotify has no linked profile (1000/month budget)
+        self.google_search_key = os.getenv("RAPIDAPI_KEY_GOOGLE_SEARCH")
         self.token = None
         self.token_expires_at = 0
         self.cache = {}  # Cache format: {artist_id: {'data': {...}, 'timestamp': 123}}
-        
+
         if all([self.client_id, self.client_secret]):
             logger.info("✅ Spotify credentials configured")
         else:
             logger.error("❌ Spotify credentials missing")
-        
+
         if self.rapidapi_key:
             logger.info("✅ RAPIDAPI_KEY_SPOTIFY configured (Spotify Scraper)")
         else:
             logger.warning("⚠️ RAPIDAPI_KEY_SPOTIFY missing - artist data will use fallback values")
+
+        if self.google_search_key:
+            logger.info("✅ RAPIDAPI_KEY_GOOGLE_SEARCH configured (Instagram fallback)")
+        else:
+            logger.warning("⚠️ RAPIDAPI_KEY_GOOGLE_SEARCH missing - no Instagram fallback for unlinked artists")
 
     def _get_token(self):
         """Get Spotify API access token (client credentials flow)"""
@@ -132,15 +140,17 @@ class SpotifyService:
             # Build Spotify URL
             spotify_url = f"https://open.spotify.com/track/{track_id}"
             
-            # Get first artist ID for scraping
+            # Get first artist ID + name (name is used for the Instagram Google Search fallback)
             artists = data.get('artists', [])
             spotify_author_id = artists[0]['id'] if artists else None
-            
+            artist_name = artists[0]['name'] if artists else None
+
             return {
                 'spotify_url': spotify_url,
                 'cover_url': cover_url,
                 'release_date': release_date,
                 'spotify_author_ID': spotify_author_id,
+                'artist_name': artist_name,
                 'label': label
             }
             
@@ -340,7 +350,75 @@ class SpotifyService:
             '_rapidapi_ok': False
         }
 
-    def _get_artist_data_with_cache(self, artist_id):
+    def _search_instagram_google(self, artist_name):
+        """
+        Instagram fallback via RapidAPI Google Search — called only when Spotify's own
+        scrape found no linked Instagram profile. Query mirrors the existing IG resolver
+        convention: "{name} instagram". Budget: 1000 requests/month on this key.
+
+        Returns a profile URL (instagram.com/<username>) or None — deliberately skips
+        non-profile hits (/p/, /reel/, /stories/, /explore/…) since those are useless as
+        a contact link.
+        """
+        if not self.google_search_key:
+            return None
+
+        url = "https://google-search116.p.rapidapi.com/"
+        headers = {
+            'x-rapidapi-key': self.google_search_key,
+            'x-rapidapi-host': 'google-search116.p.rapidapi.com',
+        }
+        params = {'query': f"{artist_name} instagram"}
+        profile_re = re.compile(r'^https?://(www\.)?instagram\.com/[^/?#]+/?(\?.*)?$', re.IGNORECASE)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=10)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    for result in (data.get('results') or []):
+                        result_url = (result.get('url') or '').strip()
+                        if profile_re.match(result_url):
+                            logger.info(f"✅ Google Search found Instagram for '{artist_name}': {result_url}")
+                            return result_url
+                    logger.info(f"ℹ️ No Instagram profile in Google Search results for '{artist_name}'")
+                    return None
+
+                elif response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Google Search rate limit for '{artist_name}', retrying... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(1)
+                        continue
+                    logger.error(f"❌ Google Search rate limit exhausted for '{artist_name}'")
+                    return None
+
+                elif response.status_code == 401:
+                    logger.warning(f"⚠️ Google Search 401 for '{artist_name}' (attempt {attempt + 1}/{max_retries}) — check RAPIDAPI_KEY_GOOGLE_SEARCH / monthly quota")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    return None
+
+                else:
+                    logger.error(f"❌ Google Search error {response.status_code} for '{artist_name}'")
+                    return None
+
+            except requests.Timeout:
+                logger.error(f"❌ Google Search timeout for '{artist_name}' (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+                return None
+
+            except Exception as e:
+                logger.error(f"❌ Google Search exception for '{artist_name}': {str(e)}")
+                return None
+
+        return None
+
+    def _get_artist_data_with_cache(self, artist_id, artist_name=None):
         """
         Get artist data with 24h cache
         
@@ -372,10 +450,19 @@ class SpotifyService:
         logger.info(f"🌐 Fetching {artist_id} from RapidAPI...")
         data = self._get_artist_data_rapidapi(artist_id)
 
-        # Only cache real successes. Caching a failure (RapidAPI down/rate-limited)
-        # would serve empty artist data for 24h on every retry, even once RapidAPI
-        # recovers seconds later.
-        if data.get('_rapidapi_ok', False):
+        # Instagram fallback: Spotify's own scrape found nothing linked, so try Google
+        # Search before this artist ever reaches a user — never at reveal time, so no one
+        # waits on it, and whatever we find here is what every future user gets too.
+        if not data.get('instagram_url') and artist_name:
+            google_ig = self._search_instagram_google(artist_name)
+            if google_ig:
+                data['instagram_url'] = google_ig
+
+        # Cache real RapidAPI successes, OR a partial failure that still landed an
+        # Instagram via the Google fallback — either way there's something worth reusing
+        # for the next user who scans this same artist. A total dud (RapidAPI failed AND
+        # no Instagram found) is never cached, so both sources get retried next time.
+        if data.get('_rapidapi_ok', False) or data.get('instagram_url'):
             self.cache[artist_id] = {
                 'data': data,
                 'timestamp': time.time()
@@ -441,20 +528,22 @@ class SpotifyService:
             
             enriched.append(enriched_track)
             
-            # Collect artist ID for RapidAPI scraping
+            # Collect artist ID + name for RapidAPI scraping (name feeds the Instagram
+            # Google Search fallback — from Spotify's official API, not the raw ACR
+            # Cloud credit string, which can hold multiple/feat. artists).
             artist_id = details.get('spotify_author_ID')
             if artist_id:
-                artist_ids_to_fetch.append(artist_id)
-        
+                artist_ids_to_fetch.append((artist_id, details.get('artist_name')))
+
         logger.info(f"✅ Enriched {len(enriched)} tracks with Spotify API data")
-        
+
         # Step 2: Fetch artist data from RapidAPI (sequential with cache)
         if artist_ids_to_fetch:
             logger.info(f"🔍 Fetching {len(artist_ids_to_fetch)} artist(s) data...")
-            
+
             scraped_data = []
-            for i, artist_id in enumerate(artist_ids_to_fetch):
-                data = self._get_artist_data_with_cache(artist_id)
+            for i, (artist_id, artist_name) in enumerate(artist_ids_to_fetch):
+                data = self._get_artist_data_with_cache(artist_id, artist_name)
                 scraped_data.append(data)
                 if i < len(artist_ids_to_fetch) - 1:
                     time.sleep(1.0)
