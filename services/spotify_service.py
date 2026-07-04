@@ -453,10 +453,14 @@ class SpotifyService:
         # Instagram fallback: Spotify's own scrape found nothing linked, so try Google
         # Search before this artist ever reaches a user — never at reveal time, so no one
         # waits on it, and whatever we find here is what every future user gets too.
+        # Flagged with instagram_via_google since this source is less reliable (a name
+        # search can land on the wrong person) — the frontend uses this flag to decide
+        # whether a user is allowed to report the contact as wrong.
         if not data.get('instagram_url') and artist_name:
             google_ig = self._search_instagram_google(artist_name)
             if google_ig:
                 data['instagram_url'] = google_ig
+                data['instagram_via_google'] = True
 
         # Cache real RapidAPI successes, OR a partial failure that still landed an
         # Instagram via the Google fallback — either way there's something worth reusing
@@ -563,6 +567,7 @@ class SpotifyService:
                         track['artist_image'] = scraped.get('artist_image')
                         track['has_discography'] = scraped.get('has_discography', True)
                         track['_rapidapi_ok'] = scraped.get('_rapidapi_ok', False)
+                        track['instagram_via_google'] = scraped.get('instagram_via_google', False)
                         scrape_index += 1
                     else:
                         # Fallback if index mismatch
