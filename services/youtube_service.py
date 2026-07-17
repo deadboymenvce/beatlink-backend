@@ -192,12 +192,17 @@ class YouTubeService:
             download_url = None
             api_calls = 0
             last_cdn_body = ''
-            deadline = time.time() + 120  # overall budget for the conversion to finish
+            # Budget kept well under Gunicorn's --timeout (currently 240s) so a CDN that
+            # never comes ready still returns None in time for app.py's graceful 500 —
+            # previously this matched the worker timeout exactly and lost that race,
+            # getting SIGKILLed mid-request instead (no error ever reached the frontend).
+            download_start = time.time()
+            deadline = download_start + 170
 
             while time.time() < deadline and file_resp is None:
                 # (Re)fetch a link when we don't have one. Capped to spare RapidAPI quota:
-                # after 4 calls we keep polling the last link until the deadline.
-                if download_url is None and api_calls < 4:
+                # after 6 calls we keep polling the last link until the deadline.
+                if download_url is None and api_calls < 6:
                     api_calls += 1
                     try:
                         logger.info(f"🚀 Requesting audio link (call {api_calls}): id={video_id}")
@@ -239,12 +244,12 @@ class YouTubeService:
 
                 # Still converting → drop this link to grab a fresh one (until the API cap),
                 # then back off before the next attempt.
-                if api_calls < 4:
+                if api_calls < 6:
                     download_url = None
                 time.sleep(6)
 
             if not file_resp:
-                logger.error(f"❌ Could not download the M4A within {int(time.time() - (deadline - 120))}s "
+                logger.error(f"❌ Could not download the M4A within {int(time.time() - download_start)}s "
                              f"(last CDN body: {last_cdn_body or 'n/a'})")
                 return None
 
