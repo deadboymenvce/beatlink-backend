@@ -5,7 +5,6 @@ import tempfile
 import subprocess
 import re
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -174,39 +173,39 @@ class YouTubeService:
         }
         url = f"https://{self.rapidapi_sync_host}/download-m4a/{video_id}"
 
-        # Two quick attempts — this is a single-shot API, not a job to poll, so a couple of
-        # tries covers a transient network blip without burning much time before falling
-        # back to the CDN provider.
-        for attempt in (1, 2):
-            try:
-                logger.info(f"🚀 [sync] Requesting M4A (attempt {attempt}): id={video_id}")
-                r = requests.get(url, headers=headers, timeout=(10, 30), stream=True)
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"⚠️ [sync] Request failed (attempt {attempt}): {e}")
-                continue
+        # Single attempt with a generous read timeout: this provider transcodes the file
+        # server-side BEFORE it streams a single byte, so the first byte can take ~40-50s.
+        # The old 30s read-timeout cut that off mid-transcode and forced a wasteful retry
+        # (which is exactly what made scans feel slow). 90s covers virtually any transcode;
+        # once bytes start flowing the partial cap stops us in ~1s. On any failure we fall
+        # through to the CDN provider rather than retrying the slow transcode here.
+        try:
+            logger.info(f"🚀 [sync] Requesting M4A: id={video_id}")
+            r = requests.get(url, headers=headers, timeout=(10, 90), stream=True)
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"⚠️ [sync] Request failed: {e}")
+            return False
 
-            if r.status_code != 200:
-                logger.warning(f"⚠️ [sync] Non-200: {r.status_code} - {r.text[:200]}")
-                continue
+        if r.status_code != 200:
+            logger.warning(f"⚠️ [sync] Non-200: {r.status_code} - {r.text[:200]}")
+            return False
 
-            ctype = r.headers.get('content-type', '')
-            if 'octet-stream' not in ctype and 'audio' not in ctype:
-                logger.warning(f"⚠️ [sync] Unexpected content-type: {ctype}")
-                continue
+        ctype = r.headers.get('content-type', '')
+        if 'octet-stream' not in ctype and 'audio' not in ctype:
+            logger.warning(f"⚠️ [sync] Unexpected content-type: {ctype}")
+            return False
 
-            written = 0
-            with open(raw_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        written += len(chunk)
-                        if max_bytes and written >= max_bytes:
-                            break
-            r.close()
-            logger.info(f"✅ [sync] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
-            return True
-
-        return False
+        written = 0
+        with open(raw_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    written += len(chunk)
+                    if max_bytes and written >= max_bytes:
+                        break
+        r.close()
+        logger.info(f"✅ [sync] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
+        return True
 
     def _fetch_raw_via_cdn_api(self, video_id, raw_path, max_bytes=None):
         """
@@ -235,7 +234,10 @@ class YouTubeService:
         # Previously this matched the worker timeout exactly and lost that race, getting
         # SIGKILLed mid-request instead of reaching app.py's graceful 500.
         download_start = time.time()
-        deadline = download_start + 150
+        # Fallback budget: the sync provider may already have spent up to ~90s before we
+        # get here, so cap the CDN at 120s to stay under Gunicorn's --timeout with room
+        # for the moov re-download + ACRCloud + Spotify + response.
+        deadline = download_start + 120
 
         while time.time() < deadline and file_resp is None:
             # (Re)fetch a link when we don't have one. Capped to spare RapidAPI quota:
@@ -304,41 +306,6 @@ class YouTubeService:
         logger.info(f"✅ [cdn] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
         return True
 
-    def _download_raw_parallel(self, video_id, max_bytes):
-        """
-        Fire both providers at once and take whichever returns a valid file first — so a
-        slow/failing provider never stalls the scan (before, a failed sync attempt was
-        waited out in full BEFORE the CDN even started). Costs one extra RapidAPI call
-        per scan; that tradeoff is deliberate.
-        Returns (provider_name, raw_path) or None.
-        """
-        sync_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_sync.m4a')
-        cdn_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_cdn.m4a')
-        jobs = [
-            ('sync', sync_path, self._fetch_raw_via_sync_api),
-            ('cdn', cdn_path, self._fetch_raw_via_cdn_api),
-        ]
-
-        ex = ThreadPoolExecutor(max_workers=2)
-        futures = {ex.submit(fn, video_id, path, max_bytes): (name, path) for name, path, fn in jobs}
-        winner = None
-        try:
-            for fut in as_completed(futures):
-                name, path = futures[fut]
-                try:
-                    ok = fut.result()
-                except Exception as e:
-                    logger.warning(f"⚠️ [{name}] provider raised: {e}")
-                    ok = False
-                if ok and os.path.exists(path) and os.path.getsize(path) > 0:
-                    logger.info(f"🏆 Download won by [{name}]")
-                    winner = (name, path)
-                    break
-        finally:
-            # Don't block the request on the loser — it finishes on its own in the background.
-            ex.shutdown(wait=False)
-        return winner
-
     def _extract_30s(self, raw_path, video_id):
         """
         FFmpeg-extract the 30s ACRCloud slice (from the 15s mark) out of raw_path.
@@ -387,12 +354,14 @@ class YouTubeService:
 
     def download_audio(self, youtube_url):
         """
-        Get a 30s M4A slice for ACRCloud. Fires both RapidAPI providers in parallel and
-        takes the first valid file (a single provider being down/slow no longer fails the
-        scan), downloading only a partial slice of the file rather than the whole track.
+        Get a 30s M4A slice for ACRCloud. Sequential, sync-provider first: the direct-M4A
+        provider is privileged and the slower CDN-polling provider is only touched if the
+        sync one fails — so a normal scan never burns CDN quota or spins a wasted background
+        download (which the earlier parallel version did on every scan). Only a partial
+        slice of the file is pulled, not the whole track.
 
         If the partial file can't be decoded (its M4A moov atom sat past the cut), we
-        re-download the FULL file from the provider that won and extract from that — so
+        re-download the FULL file from whichever provider won and extract from that — so
         the partial-download optimization can never turn into a failed scan.
         """
         video_id = self._extract_video_id(youtube_url)
@@ -405,31 +374,38 @@ class YouTubeService:
         for ext in ('webm', 'm4a', 'mp4', 'mp3', 'wav'):
             for name in (f'beatlink_{video_id}.{ext}',
                          f'beatlink_{video_id}_raw.{ext}',
-                         f'beatlink_{video_id}_raw_sync.{ext}',
-                         f'beatlink_{video_id}_raw_cdn.{ext}',
                          f'beatlink_{video_id}_raw_full.{ext}'):
                 p = os.path.join(self.temp_dir, name)
                 if os.path.exists(p):
                     os.remove(p)
 
+        raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.m4a')
+
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
 
-            # #3 parallel + #1 partial
-            winner = self._download_raw_parallel(video_id, PARTIAL_CAP_BYTES)
+            # Privilege the fast direct-M4A provider; only fall back to the slow CDN one
+            # if it actually fails.
+            winner = None
+            if self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                winner = 'sync'
+            else:
+                logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
+                if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                    winner = 'cdn'
+
             if not winner:
                 logger.error("❌ Both audio providers failed")
                 return None
-            name, raw_path = winner
 
             m4a_path = self._extract_30s(raw_path, video_id)
             if m4a_path:
                 return m4a_path
 
             # Partial slice couldn't be decoded — re-download the FULL file from the winner.
-            logger.warning(f"⚠️ Partial extract failed — re-downloading full file from [{name}]...")
+            logger.warning(f"⚠️ Partial extract failed — re-downloading full file from [{winner}]...")
             full_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_full.m4a')
-            fetch_fn = self._fetch_raw_via_sync_api if name == 'sync' else self._fetch_raw_via_cdn_api
+            fetch_fn = self._fetch_raw_via_sync_api if winner == 'sync' else self._fetch_raw_via_cdn_api
             if not fetch_fn(video_id, full_path, None):
                 logger.error("❌ Full re-download failed")
                 return None
