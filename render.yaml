@@ -1,11 +1,20 @@
+# ⚠️ NOTE: this service was created MANUALLY in the Render dashboard, not from this
+# blueprint, so Render currently IGNORES this file. The authoritative config (plan,
+# Start Command) lives in the dashboard. This file is kept in sync as documentation and
+# so a future Blueprint adoption would be correct — but changing it here does NOT change
+# the running service. To change the Start Command you MUST edit it in the dashboard.
 services:
   - type: web
     name: beatlink-api
     env: python
-    region: frankfurt
-    plan: free
+    region: frankfurt          # EU, already close to Spotify/RapidAPI
+    plan: starter              # $7/mo, no spin-down (so no keep-alive needed)
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 280 --workers 1 app:app
+    # gthread + threads (not more processes): a scan is I/O-bound (waits on RapidAPI /
+    # ACRCloud / Spotify), so threads give concurrent scans without multiplying the
+    # 512MB RAM the way extra --workers would. --timeout 280 gives headroom for a slow
+    # CDN-fallback scan + the full-file moov re-download.
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --worker-class gthread --workers 1 --threads 4 --timeout 280 app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
