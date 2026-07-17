@@ -5,8 +5,14 @@ import tempfile
 import subprocess
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
+
+# We only ever keep a 30s slice (from the 15s mark) for ACRCloud, so there's no reason to
+# pull the whole 3-4 min file. ~1.5 MB covers ~90s @128kbps / ~180s @64kbps — always well
+# past the 45s the FFmpeg extract needs, with margin for the container's framing.
+PARTIAL_CAP_BYTES = 1_500_000
 
 
 class YouTubeService:
@@ -153,12 +159,13 @@ class YouTubeService:
                 'message': f'Error: {str(e)}'
             }
 
-    def _fetch_raw_via_sync_api(self, video_id, raw_path):
+    def _fetch_raw_via_sync_api(self, video_id, raw_path, max_bytes=None):
         """
         Primary provider: youtube-mp3-audio-video-downloader — one request, returns the
         M4A binary directly (no polling). Fast (~30s observed) and simple: it either
         works or it doesn't, so failures here are cheap and we move on quickly.
-        Returns True if raw_path was written, False otherwise (never raises).
+        When max_bytes is set, stops reading once that many bytes are on disk (partial
+        download — see PARTIAL_CAP_BYTES). Returns True if raw_path was written.
         """
         headers = {
             'Content-Type': 'application/json',
@@ -187,28 +194,37 @@ class YouTubeService:
                 logger.warning(f"⚠️ [sync] Unexpected content-type: {ctype}")
                 continue
 
+            written = 0
             with open(raw_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            logger.info(f"✅ [sync] M4A downloaded ({os.path.getsize(raw_path) // 1024} KB)")
+                        written += len(chunk)
+                        if max_bytes and written >= max_bytes:
+                            break
+            r.close()
+            logger.info(f"✅ [sync] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
             return True
 
         return False
 
-    def _fetch_raw_via_cdn_api(self, video_id, raw_path):
+    def _fetch_raw_via_cdn_api(self, video_id, raw_path, max_bytes=None):
         """
         Fallback provider: youtube-mp3-2025 — async, on-demand transcode. Hands back a
         CDN link that 504s ("not ready") until conversion finishes, so this polls:
         re-requesting a fresh link a few times and retrying the CDN with backoff.
-        Returns True if raw_path was written, False otherwise (never raises).
+        When max_bytes is set, stops reading once that many bytes are on disk (partial
+        download). Returns True if raw_path was written, False otherwise (never raises).
         """
         headers = {
             'x-rapidapi-key': self.rapidapi_key,
             'x-rapidapi-host': self.rapidapi_host,
         }
         info_url = f"https://{self.rapidapi_host}/v1/social/youtube/audio"
-        params = {'id': video_id, 'quality': '128kbps', 'ext': 'm4a'}
+        # 64kbps instead of 128 — ACRCloud fingerprints, it doesn't listen, so half the
+        # bitrate = ~half the bytes to transcode/transfer. If this provider ever rejects
+        # 64kbps the CDN call just fails and the parallel sync provider carries the scan.
+        params = {'id': video_id, 'quality': '64kbps', 'ext': 'm4a'}
 
         file_resp = None
         download_url = None
@@ -276,70 +292,73 @@ class YouTubeService:
             return False
 
         logger.info("⬇️ [cdn] CDN ready — downloading M4A...")
+        written = 0
         with open(raw_path, 'wb') as f:
             for chunk in file_resp.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        logger.info(f"✅ [cdn] M4A downloaded ({os.path.getsize(raw_path) // 1024} KB)")
+                    written += len(chunk)
+                    if max_bytes and written >= max_bytes:
+                        break
+        file_resp.close()
+        logger.info(f"✅ [cdn] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
         return True
 
-    def download_audio(self, youtube_url):
+    def _download_raw_parallel(self, video_id, max_bytes):
         """
-        Download audio, trying the fast synchronous provider first and falling back to
-        the async CDN provider if it fails or is unavailable — a single provider going
-        down (which is exactly what happened before, twice) no longer fails every scan.
-
-        After a raw file is obtained (from either provider), we extract 30 seconds with
-        FFmpeg for ACR Cloud — that part is shared, done once regardless of which
-        provider succeeded.
+        Fire both providers at once and take whichever returns a valid file first — so a
+        slow/failing provider never stalls the scan (before, a failed sync attempt was
+        waited out in full BEFORE the CDN even started). Costs one extra RapidAPI call
+        per scan; that tradeoff is deliberate.
+        Returns (provider_name, raw_path) or None.
         """
-        video_id = self._extract_video_id(youtube_url)
+        sync_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_sync.m4a')
+        cdn_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_cdn.m4a')
+        jobs = [
+            ('sync', sync_path, self._fetch_raw_via_sync_api),
+            ('cdn', cdn_path, self._fetch_raw_via_cdn_api),
+        ]
 
-        if not video_id:
-            logger.error("❌ Could not extract video ID from URL")
+        ex = ThreadPoolExecutor(max_workers=2)
+        futures = {ex.submit(fn, video_id, path, max_bytes): (name, path) for name, path, fn in jobs}
+        winner = None
+        try:
+            for fut in as_completed(futures):
+                name, path = futures[fut]
+                try:
+                    ok = fut.result()
+                except Exception as e:
+                    logger.warning(f"⚠️ [{name}] provider raised: {e}")
+                    ok = False
+                if ok and os.path.exists(path) and os.path.getsize(path) > 0:
+                    logger.info(f"🏆 Download won by [{name}]")
+                    winner = (name, path)
+                    break
+        finally:
+            # Don't block the request on the loser — it finishes on its own in the background.
+            ex.shutdown(wait=False)
+        return winner
+
+    def _extract_30s(self, raw_path, video_id):
+        """
+        FFmpeg-extract the 30s ACRCloud slice (from the 15s mark) out of raw_path.
+        Returns the m4a path, or None if extraction failed (e.g. a partial download that
+        truncated the container's moov atom, which the caller handles by re-downloading
+        the full file). Always removes raw_path.
+        """
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
             return None
 
-        # Clean up any existing files
-        for ext in ('webm', 'm4a', 'mp4', 'mp3', 'wav'):
-            f = os.path.join(self.temp_dir, f'beatlink_{video_id}.{ext}')
-            if os.path.exists(f):
-                os.remove(f)
-            f_raw = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.{ext}')
-            if os.path.exists(f_raw):
-                os.remove(f_raw)
-
-        raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.m4a')
-
+        m4a_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.m4a')
+        logger.info("🔄 Extracting 30 seconds (optimized for ACR Cloud)...")
         try:
-            logger.info(f"🎵 Downloading audio for {video_id}...")
-
-            got_raw = self._fetch_raw_via_sync_api(video_id, raw_path)
-            if not got_raw:
-                logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
-                got_raw = self._fetch_raw_via_cdn_api(video_id, raw_path)
-
-            if not got_raw:
-                logger.error("❌ Both audio providers failed")
-                return None
-
-            # OPTIMIZATION: Extract only 30 seconds for ACR Cloud
-            # ACR Cloud accepts M4A format, so we keep it as M4A (no conversion needed)
-            m4a_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.m4a')
-
-            logger.info("🔄 Extracting 30 seconds (optimized for ACR Cloud)...")
-
-            # Use FFmpeg to extract 30 seconds starting from 15s mark
-            # -ss 15: Start at 15 seconds (skip potential intro/silence)
-            # -t 30: Extract 30 seconds duration
-            # -acodec copy: Copy codec without re-encoding (faster, no quality loss)
-            # Keeps M4A format (ACR Cloud supports it)
             ffmpeg_result = subprocess.run(
                 [
                     'ffmpeg',
                     '-i', raw_path,
                     '-ss', '15',       # Start at 15 seconds
                     '-t', '30',        # Extract 30 seconds
-                    '-acodec', 'copy', # Copy without re-encoding
+                    '-acodec', 'copy', # Copy without re-encoding (faster, no quality loss)
                     '-y',              # Overwrite if exists
                     m4a_path
                 ],
@@ -347,23 +366,74 @@ class YouTubeService:
                 text=True,
                 timeout=60
             )
-
-            # Clean up raw file immediately to save space
+        except Exception as e:
+            logger.error(f"❌ FFmpeg run failed: {e}")
             if os.path.exists(raw_path):
                 os.remove(raw_path)
-                logger.info(f"🗑️ Cleaned up raw file")
+            return None
 
-            if ffmpeg_result.returncode != 0:
-                logger.error(f"❌ FFmpeg error: {ffmpeg_result.stderr[-500:]}")
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+        if ffmpeg_result.returncode != 0:
+            logger.warning(f"⚠️ FFmpeg extract failed (returncode {ffmpeg_result.returncode}): {ffmpeg_result.stderr[-300:]}")
+            return None
+
+        if os.path.exists(m4a_path) and os.path.getsize(m4a_path) > 0:
+            logger.info(f"✅ M4A ready: {m4a_path} ({os.path.getsize(m4a_path) // 1024} KB) - 30s extract")
+            return m4a_path
+
+        return None
+
+    def download_audio(self, youtube_url):
+        """
+        Get a 30s M4A slice for ACRCloud. Fires both RapidAPI providers in parallel and
+        takes the first valid file (a single provider being down/slow no longer fails the
+        scan), downloading only a partial slice of the file rather than the whole track.
+
+        If the partial file can't be decoded (its M4A moov atom sat past the cut), we
+        re-download the FULL file from the provider that won and extract from that — so
+        the partial-download optimization can never turn into a failed scan.
+        """
+        video_id = self._extract_video_id(youtube_url)
+
+        if not video_id:
+            logger.error("❌ Could not extract video ID from URL")
+            return None
+
+        # Clean up any existing files (all raw variants included)
+        for ext in ('webm', 'm4a', 'mp4', 'mp3', 'wav'):
+            for name in (f'beatlink_{video_id}.{ext}',
+                         f'beatlink_{video_id}_raw.{ext}',
+                         f'beatlink_{video_id}_raw_sync.{ext}',
+                         f'beatlink_{video_id}_raw_cdn.{ext}',
+                         f'beatlink_{video_id}_raw_full.{ext}'):
+                p = os.path.join(self.temp_dir, name)
+                if os.path.exists(p):
+                    os.remove(p)
+
+        try:
+            logger.info(f"🎵 Downloading audio for {video_id}...")
+
+            # #3 parallel + #1 partial
+            winner = self._download_raw_parallel(video_id, PARTIAL_CAP_BYTES)
+            if not winner:
+                logger.error("❌ Both audio providers failed")
                 return None
+            name, raw_path = winner
 
-            if os.path.exists(m4a_path):
-                size_kb = os.path.getsize(m4a_path) // 1024
-                logger.info(f"✅ M4A ready: {m4a_path} ({size_kb} KB) - Optimized 30s extract")
+            m4a_path = self._extract_30s(raw_path, video_id)
+            if m4a_path:
                 return m4a_path
 
-            logger.error("❌ M4A file not found after extraction")
-            return None
+            # Partial slice couldn't be decoded — re-download the FULL file from the winner.
+            logger.warning(f"⚠️ Partial extract failed — re-downloading full file from [{name}]...")
+            full_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_full.m4a')
+            fetch_fn = self._fetch_raw_via_sync_api if name == 'sync' else self._fetch_raw_via_cdn_api
+            if not fetch_fn(video_id, full_path, None):
+                logger.error("❌ Full re-download failed")
+                return None
+            return self._extract_30s(full_path, video_id)
 
         except Exception as e:
             logger.error(f"❌ Download error: {str(e)}", exc_info=True)

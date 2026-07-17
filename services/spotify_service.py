@@ -4,8 +4,14 @@ import logging
 import requests
 import base64
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+# Bounded concurrency for the per-artist RapidAPI calls: enough to collapse the old
+# sequential-with-1s-sleep loop, low enough that the existing 429-retry logic absorbs any
+# rate-limit blips rather than triggering a storm of them.
+ENRICH_MAX_WORKERS = 4
 
 
 class SpotifyService:
@@ -487,15 +493,22 @@ class SpotifyService:
         """
         if not matches:
             return []
-        
+
         enriched = []
         artist_ids_to_fetch = []
-        
-        # Step 1: Get Spotify details for each match
-        for match in matches:
-            spotify_id = match.get('spotify_id', '')
-            
-            if not spotify_id:
+
+        # Step 1: Get Spotify track details — in parallel across matches (order preserved by
+        # executor.map, which the index-aligned merge below relies on). Pre-fetch the token
+        # once so the threads all reuse it instead of racing to refresh it.
+        self._get_token()
+        with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as ex:
+            details_list = list(ex.map(
+                lambda m: self._get_track_details(m['spotify_id']) if m.get('spotify_id') else None,
+                matches
+            ))
+
+        for match, details in zip(matches, details_list):
+            if details is None:
                 # ACR Cloud matched this track via a non-Spotify database (Gracenote, Deezer…)
                 # Without a Spotify track ID we cannot get artist data or cover art → will be filtered
                 logger.warning(f"⚠️ No Spotify ID for '{match['title']}' by {match['artists']} — will be dropped (ACR match without Spotify link)")
@@ -515,10 +528,7 @@ class SpotifyService:
                     'artist_image': None
                 })
                 continue
-            
-            # Get Spotify details via official API
-            details = self._get_track_details(spotify_id)
-            
+
             # Build enriched track
             enriched_track = {
                 'title': match['title'],
@@ -529,9 +539,9 @@ class SpotifyService:
                 'release_date': details.get('release_date'),
                 'score': match['score']
             }
-            
+
             enriched.append(enriched_track)
-            
+
             # Collect artist ID + name for RapidAPI scraping (name feeds the Instagram
             # Google Search fallback — from Spotify's official API, not the raw ACR
             # Cloud credit string, which can hold multiple/feat. artists).
@@ -541,17 +551,19 @@ class SpotifyService:
 
         logger.info(f"✅ Enriched {len(enriched)} tracks with Spotify API data")
 
-        # Step 2: Fetch artist data from RapidAPI (sequential with cache)
+        # Step 2: Fetch artist data from RapidAPI — in parallel (bounded), cache-backed.
+        # Replaces the old sequential loop with a fixed 1s sleep between each artist; the
+        # existing 429-retry/backoff inside _get_artist_data_rapidapi is the rate-limit
+        # safety net. Order preserved by executor.map for the index-aligned merge below.
         if artist_ids_to_fetch:
-            logger.info(f"🔍 Fetching {len(artist_ids_to_fetch)} artist(s) data...")
+            logger.info(f"🔍 Fetching {len(artist_ids_to_fetch)} artist(s) data (parallel)...")
 
-            scraped_data = []
-            for i, (artist_id, artist_name) in enumerate(artist_ids_to_fetch):
-                data = self._get_artist_data_with_cache(artist_id, artist_name)
-                scraped_data.append(data)
-                if i < len(artist_ids_to_fetch) - 1:
-                    time.sleep(1.0)
-            
+            with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as ex:
+                scraped_data = list(ex.map(
+                    lambda pair: self._get_artist_data_with_cache(pair[0], pair[1]),
+                    artist_ids_to_fetch
+                ))
+
             # Step 3: Merge scraped data with enriched tracks
             scrape_index = 0
             for track in enriched:
