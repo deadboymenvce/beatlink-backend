@@ -6,6 +6,7 @@ from services.youtube_service import YouTubeService
 from services.acrcloud_service import ACRCloudService
 from services.spotify_service import SpotifyService
 from services.brave_search_service import BraveSearchService
+from services.scan_logger import ScanLogger
  
 # Configure logging
 logging.basicConfig(
@@ -53,52 +54,64 @@ def scan_beat():
         "results_count": int
     }
     """
+    # Parse the body up front so we can build the scan logger (scan_id correlates these
+    # logs to the uploaded_beat the frontend creates after the scan).
+    data = request.get_json(silent=True) or {}
+    youtube_url = data.get('youtube_url')
+    scan_id = data.get('scan_id')
+    scan_log = ScanLogger(scan_id, youtube_url)
+
     try:
-        # Get YouTube URL from request
-        data = request.get_json()
-        
-        if not data or 'youtube_url' not in data:
+        if not youtube_url:
             return jsonify({
                 'success': False,
                 'error': 'missing_url',
                 'message': 'youtube_url is required in request body'
             }), 400
-        
-        youtube_url = data['youtube_url']
-        
+
         logger.info(f"📥 Scanning YouTube URL: {youtube_url}")
-        
+        scan_log.log('received', f'Scan requested for {youtube_url}', data={'scan_id': scan_id})
+
         # Step 1: Get video metadata
         logger.info("⬇️ Step 1: Getting video metadata...")
         video_info = youtube_service.get_video_info(youtube_url)
-        
+
         if not video_info['success']:
+            scan_log.error('metadata', f"Metadata lookup failed: {video_info.get('message')}", data={'error': video_info.get('error')})
             return jsonify({
                 'success': False,
                 'error': video_info['error'],
                 'message': video_info['message']
             }), 400
-        
+
+        scan_log.log('metadata', f"Resolved \"{video_info['title']}\" by {video_info['author']}", data={
+            'title': video_info['title'], 'author': video_info['author'], 'views': video_info['views'],
+        })
+
         # Step 2: Download audio via Apify
         logger.info("🎵 Step 2: Downloading audio via Apify...")
         audio_path = youtube_service.download_audio(youtube_url)
-        
+
         if not audio_path:
+            scan_log.error('download', 'Audio download failed (no file returned)')
             return jsonify({
                 'success': False,
                 'error': 'download_failed',
                 'message': 'Failed to download audio from YouTube'
             }), 500
-        
+
+        scan_log.log('download', 'Audio downloaded')
+
         # Step 3: Identify audio with ACR Cloud
         logger.info("🔍 Step 3: Identifying audio with ACR Cloud...")
         matches = acrcloud_service.identify_audio(audio_path)
-        
+
         # Clean up audio file
         youtube_service.cleanup_audio(audio_path)
-        
+
         if not matches:
             logger.info("ℹ️ No matches found in ACR Cloud")
+            scan_log.warn('acrcloud', 'ACRCloud returned 0 matches — no buyers for this beat')
             return jsonify({
                 'success': True,
                 'uploaded_beat': {
@@ -111,15 +124,20 @@ def scan_beat():
                 'matched_songs': [],
                 'results_count': 0
             }), 200
-        
+
         logger.info(f"✅ ACR Cloud found {len(matches)} matches")
-        
+        scan_log.log('acrcloud', f'ACRCloud found {len(matches)} raw match(es)', data={
+            'count': len(matches),
+            'titles': [m.get('title') for m in matches][:20],
+        })
+
         # Step 4: Enrich with Spotify metadata
         logger.info("🎵 Step 4: Enriching with Spotify metadata...")
         enriched_songs = spotify_service.enrich_tracks(matches)
-        
+
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
-        
+        scan_log.log('spotify', f'Enriched {len(enriched_songs)} song(s) with Spotify data', data={'count': len(enriched_songs)})
+
         # FILTER: Keep only songs with complete Spotify data
         # Ghost artist rule: only drop when RapidAPI *succeeded* and confirmed 0 published tracks.
         # If RapidAPI failed (401, timeout…), has_discography defaults to True (benefit of doubt).
@@ -129,9 +147,26 @@ def scan_beat():
             and song.get('cover_url')
             and song.get('has_discography', True)
         ]
-        
+
+        # Record why each enriched song was kept or dropped, so a "why so few results?" is answerable.
+        dropped = []
+        for song in enriched_songs:
+            reasons = []
+            if not song.get('spotify_url'):
+                reasons.append('no Spotify URL')
+            if not song.get('cover_url'):
+                reasons.append('no cover')
+            if not song.get('has_discography', True):
+                reasons.append('ghost artist (0 published tracks)')
+            if reasons:
+                dropped.append({'name': song.get('artists') or song.get('title'), 'reasons': reasons})
+
         logger.info(f"🔍 Filtered from {len(enriched_songs)} to {len(filtered_songs)} complete results")
-        
+        scan_log.log('filter', f'Kept {len(filtered_songs)} of {len(enriched_songs)} after the completeness/ghost-artist filter', data={
+            'kept': len(filtered_songs), 'dropped': len(dropped), 'dropped_detail': dropped[:20],
+        })
+        scan_log.log('result', f'Scan complete — {len(filtered_songs)} buyer(s) returned', data={'results_count': len(filtered_songs)})
+
         # Return results
         return jsonify({
             'success': True,
@@ -145,14 +180,17 @@ def scan_beat():
             'matched_songs': filtered_songs,
             'results_count': len(filtered_songs)
         }), 200
-        
+
     except Exception as e:
         logger.error(f"❌ Unexpected error: {str(e)}", exc_info=True)
+        scan_log.error('error', f'Unexpected server error: {str(e)}')
         return jsonify({
             'success': False,
             'error': 'internal_error',
             'message': f'Internal server error: {str(e)}'
         }), 500
+    finally:
+        scan_log.flush()
 
 
 @app.route('/reveal-instagram', methods=['POST'])
