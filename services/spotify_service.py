@@ -5,6 +5,7 @@ import requests
 import base64
 import time
 from concurrent.futures import ThreadPoolExecutor
+from services.bio_parser import extract_contacts, has_any_contact
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,9 @@ class SpotifyService:
 
                     # Parse Instagram and Twitter (OPTIONAL)
                     profile = artist_data.get('profile') or {}
+                    # Biography free text — parsed later for handles the artist wrote but
+                    # didn't link (many small artists put "instagram: @x" straight in the bio).
+                    bio_text = (profile.get('biography') or {}).get('text')
                     external_links = (profile.get('externalLinks') or {}).get('items') or []
                     instagram_url = None
                     twitter_url = None
@@ -300,6 +304,9 @@ class SpotifyService:
                         'city': city,
                         'instagram_url': instagram_url,
                         'twitter_url': twitter_url,
+                        'tiktok_url': None,   # never in Spotify externalLinks — only ever from the bio
+                        'email': None,
+                        'bio': bio_text,
                         'last_release_date': last_release_date,
                         'artist_image': artist_image,
                         'has_discography': has_discography,
@@ -351,6 +358,9 @@ class SpotifyService:
             'city': None,
             'instagram_url': None,
             'twitter_url': None,
+            'tiktok_url': None,
+            'email': None,
+            'bio': None,
             'last_release_date': None,
             'artist_image': None,
             '_rapidapi_ok': False
@@ -456,22 +466,48 @@ class SpotifyService:
         logger.info(f"🌐 Fetching {artist_id} from RapidAPI...")
         data = self._get_artist_data_rapidapi(artist_id)
 
-        # Instagram fallback: Spotify's own scrape found nothing linked, so try Google
-        # Search before this artist ever reaches a user — never at reveal time, so no one
-        # waits on it, and whatever we find here is what every future user gets too.
-        # Flagged with instagram_via_google since this source is less reliable (a name
-        # search can land on the wrong person) — the frontend uses this flag to decide
-        # whether a user is allowed to report the contact as wrong.
-        if not data.get('instagram_url') and artist_name:
+        # Bio-declared contacts — many artists write their handles straight into the bio
+        # without linking them ("instagram: @x", "x on ig", "tiktok.com/@x"…). This is the
+        # artist's own declaration → reliable, treated like a linked profile (NOT flagged
+        # instagram_via_google). It's also the ONLY source of TikTok, since Spotify's
+        # externalLinks never carry TikTok. Runs for every artist without a linked handle.
+        contacts = extract_contacts(data.get('bio'))
+        if not data.get('instagram_url') and contacts['instagram']:
+            data['instagram_url'] = contacts['instagram']
+        if not data.get('tiktok_url') and contacts['tiktok']:
+            data['tiktok_url'] = contacts['tiktok']
+        if not data.get('twitter_url') and contacts['twitter']:
+            data['twitter_url'] = contacts['twitter']
+        if not data.get('email') and contacts['email']:
+            data['email'] = contacts['email']
+
+        # Name-based Instagram search — LAST resort, and ONLY for artists we've CONFIRMED have
+        # >= 100 monthly listeners. Below that, "{name} instagram" mostly lands on the wrong
+        # account (small artists have poorly-differentiated names), so we skip it entirely
+        # rather than hand back a probably-wrong contact. Flagged instagram_via_google since
+        # this source is the least reliable (the frontend uses the flag to gate reporting).
+        if (not data.get('instagram_url') and artist_name
+                and data.get('_rapidapi_ok') and (data.get('listeners') or 0) >= 100):
             google_ig = self._search_instagram_google(artist_name)
             if google_ig:
                 data['instagram_url'] = google_ig
                 data['instagram_via_google'] = True
 
-        # Cache real RapidAPI successes, OR a partial failure that still landed an
-        # Instagram via the Google fallback — either way there's something worth reusing
-        # for the next user who scans this same artist. A total dud (RapidAPI failed AND
-        # no Instagram found) is never cached, so both sources get retried next time.
+        # low_signal: a CONFIRMED sub-100 artist with NO reachable contact anywhere (no linked
+        # or bio Instagram/Twitter/TikTok, no bio email). Not dropped — kept and flagged (shown
+        # as the existing "theft suspected" badge, driven by a SEPARATE column the availability
+        # cron never touches). Only when RapidAPI actually succeeded: a failed lookup means
+        # "unknown", not "tiny", so we never tag on an API failure.
+        has_contact = bool(data.get('instagram_url') or data.get('tiktok_url')
+                           or data.get('twitter_url') or data.get('email'))
+        data['low_signal'] = bool(
+            data.get('_rapidapi_ok') and (data.get('listeners') or 0) < 100 and not has_contact
+        )
+
+        # Cache real RapidAPI successes, OR a partial failure that still landed an Instagram
+        # via the name search — either way there's something worth reusing for the next user
+        # who scans this same artist. A total dud (RapidAPI failed AND nothing found) is never
+        # cached, so it gets retried next time.
         if data.get('_rapidapi_ok', False) or data.get('instagram_url'):
             self.cache[artist_id] = {
                 'data': data,
@@ -524,6 +560,9 @@ class SpotifyService:
                     'city': None,
                     'instagram_url': None,
                     'twitter_url': None,
+                    'tiktok_url': None,
+                    'email': None,
+                    'low_signal': False,
                     'last_release_date': None,
                     'artist_image': None
                 })
@@ -575,6 +614,9 @@ class SpotifyService:
                         track['city'] = scraped.get('city')
                         track['instagram_url'] = scraped.get('instagram_url')
                         track['twitter_url'] = scraped.get('twitter_url')
+                        track['tiktok_url'] = scraped.get('tiktok_url')
+                        track['email'] = scraped.get('email')
+                        track['low_signal'] = scraped.get('low_signal', False)
                         track['last_release_date'] = scraped.get('last_release_date')
                         track['artist_image'] = scraped.get('artist_image')
                         track['has_discography'] = scraped.get('has_discography', True)
@@ -587,6 +629,9 @@ class SpotifyService:
                         track['city'] = None
                         track['instagram_url'] = None
                         track['twitter_url'] = None
+                        track['tiktok_url'] = None
+                        track['email'] = None
+                        track['low_signal'] = False
                         track['last_release_date'] = None
                         track['artist_image'] = None
                 else:
@@ -595,6 +640,9 @@ class SpotifyService:
                     track['city'] = None
                     track['instagram_url'] = None
                     track['twitter_url'] = None
+                    track['tiktok_url'] = None
+                    track['email'] = None
+                    track['low_signal'] = False
                     track['last_release_date'] = None
                     track['artist_image'] = None
             
@@ -608,7 +656,10 @@ class SpotifyService:
                     track['city'] = None
                     track['instagram_url'] = None
                     track['twitter_url'] = None
+                    track['tiktok_url'] = None
+                    track['email'] = None
+                    track['low_signal'] = False
                     track['last_release_date'] = None
                     track['artist_image'] = None
-        
+
         return enriched
