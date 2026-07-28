@@ -6,6 +6,7 @@ import base64
 import time
 from concurrent.futures import ThreadPoolExecutor
 from services.bio_parser import extract_contacts, has_any_contact
+from services.api_usage_tracker import record_api_usage
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +195,8 @@ class SpotifyService:
         for attempt in range(max_retries):
             try:
                 response = requests.get(url, headers=headers, timeout=10)
-                
+                record_api_usage('real-time-spotify-data-scraper', response.headers)
+
                 if response.status_code == 200:
                     data = response.json()
 

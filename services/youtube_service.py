@@ -6,6 +6,8 @@ import subprocess
 import re
 import requests
 
+from services.api_usage_tracker import record_api_usage
+
 logger = logging.getLogger(__name__)
 
 # We only ever keep a 30s slice (from the 15s mark) for ACRCloud, so there's no reason to
@@ -182,6 +184,7 @@ class YouTubeService:
         try:
             logger.info(f"🚀 [sync] Requesting M4A: id={video_id}")
             r = requests.get(url, headers=headers, timeout=(10, 90), stream=True)
+            record_api_usage('youtube-mp3-audio-video-downloader', r.headers)
         except requests.exceptions.RequestException as e:
             logger.warning(f"⚠️ [sync] Request failed: {e}")
             return False
@@ -247,6 +250,9 @@ class YouTubeService:
                 try:
                     logger.info(f"🚀 [cdn] Requesting audio link (call {api_calls}): id={video_id}")
                     info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
+                    # Only this call goes through the RapidAPI gateway — the CDN download
+                    # below hits a plain file link, no RapidAPI headers to record there.
+                    record_api_usage('youtube-mp3-2025', info_resp.headers)
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"⚠️ [cdn] API call {api_calls} failed: {e}")
                     time.sleep(5)
