@@ -4,6 +4,7 @@ import logging
 import requests
 import base64
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor
 from services.bio_parser import extract_contacts, has_any_contact
 from services.api_usage_tracker import record_api_usage
@@ -190,8 +191,12 @@ class SpotifyService:
             'X-RapidAPI-Host': 'real-time-spotify-data-scraper.p.rapidapi.com'
         }
         
-        # Retry logic (max 3 attempts)
-        max_retries = 3
+        # Retry logic. Bumped from 3 to 6 after 2026-07-28: production logs showed the 401
+        # below is transient (same artist_id, same key, fails then succeeds seconds later
+        # within the same process — a hard-dead subscription would fail every time, not
+        # ~intermittently), but 3 attempts at a flat 2s gap wasn't consistently enough
+        # window for it to clear. See the 401 branch for the actual backoff change.
+        max_retries = 6
         for attempt in range(max_retries):
             try:
                 response = requests.get(url, headers=headers, timeout=10)
@@ -332,9 +337,16 @@ class SpotifyService:
                     reset = response.headers.get('X-RateLimit-Requests-Reset', '?')
                     logger.warning(f"⚠️ RapidAPI 401 for {artist_id} — limit:{limit} remaining:{remaining} reset:{reset} (attempt {attempt + 1}/{max_retries})")
                     if attempt < max_retries - 1:
-                        time.sleep(2)
+                        # Exponential backoff (1,2,4,8,16s) capped at 16s, plus up to 0.5s of
+                        # jitter so the 4 parallel workers (ENRICH_MAX_WORKERS) don't all
+                        # retry in lockstep and hammer the same bad window on RapidAPI's side
+                        # together. Total worst-case wait across all 6 attempts: ~31s, still
+                        # well inside Gunicorn's 280s request timeout (render.yaml).
+                        wait_time = min(2 ** attempt, 16) + random.uniform(0, 0.5)
+                        time.sleep(wait_time)
                         continue
                     else:
+                        logger.error(f"❌ RapidAPI 401 exhausted for {artist_id} after {max_retries} attempts")
                         break
 
                 else:
@@ -593,25 +605,35 @@ class SpotifyService:
         logger.info(f"✅ Enriched {len(enriched)} tracks with Spotify API data")
 
         # Step 2: Fetch artist data from RapidAPI — in parallel (bounded), cache-backed.
-        # Replaces the old sequential loop with a fixed 1s sleep between each artist; the
-        # existing 429-retry/backoff inside _get_artist_data_rapidapi is the rate-limit
-        # safety net. Order preserved by executor.map for the index-aligned merge below.
+        # Deduplicated by artist_id first: a beat scan routinely matches the same artist
+        # on more than one track, and artist_ids_to_fetch previously kept every duplicate,
+        # each dispatched as its own fully independent fetch+retry. Two uncoordinated calls
+        # for the same artist meant double the RapidAPI usage AND a real chance the two
+        # calls landed different outcomes (one 401-exhausted, one not) — the same artist
+        # showing complete data on one track and a ghost/ok=False on another, within the
+        # SAME scan. Fetching each unique id once removes both problems and, by roughly
+        # halving the calls on scans with repeat artists, statistically cuts exposure to
+        # the RapidAPI 401 flakiness investigated 2026-07-28 too.
         if artist_ids_to_fetch:
-            logger.info(f"🔍 Fetching {len(artist_ids_to_fetch)} artist(s) data (parallel)...")
+            unique_pairs = list({aid: (aid, name) for aid, name in artist_ids_to_fetch}.values())
+            logger.info(f"🔍 Fetching {len(unique_pairs)} unique artist(s) data ({len(artist_ids_to_fetch)} track references, parallel)...")
 
             with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as ex:
-                scraped_data = list(ex.map(
+                scraped_list = list(ex.map(
                     lambda pair: self._get_artist_data_with_cache(pair[0], pair[1]),
-                    artist_ids_to_fetch
+                    unique_pairs
                 ))
+            scraped_by_id = {pair[0]: data for pair, data in zip(unique_pairs, scraped_list)}
 
-            # Step 3: Merge scraped data with enriched tracks
-            scrape_index = 0
+            # Step 3: Merge scraped data with enriched tracks — looked up by the track's own
+            # artist id, not a positional counter, so every track with the same artist gets
+            # the identical (single) fetch result deterministically, not whichever of two
+            # independent attempts happened to land first.
             for track in enriched:
-                if track.get('spotify_author_ID'):
-                    # This track has an artist - merge scraped data
-                    if scrape_index < len(scraped_data):
-                        scraped = scraped_data[scrape_index]
+                artist_id = track.get('spotify_author_ID')
+                if artist_id:
+                    scraped = scraped_by_id.get(artist_id)
+                    if scraped:
                         track['listeners'] = scraped.get('listeners', 0)
                         track['city'] = scraped.get('city')
                         track['instagram_url'] = scraped.get('instagram_url')
@@ -624,9 +646,9 @@ class SpotifyService:
                         track['has_discography'] = scraped.get('has_discography', True)
                         track['_rapidapi_ok'] = scraped.get('_rapidapi_ok', False)
                         track['instagram_via_google'] = scraped.get('instagram_via_google', False)
-                        scrape_index += 1
                     else:
-                        # Fallback if index mismatch
+                        # Should not happen (every id in artist_ids_to_fetch has a
+                        # corresponding unique_pairs entry) — defensive fallback only.
                         track['listeners'] = 0
                         track['city'] = None
                         track['instagram_url'] = None
