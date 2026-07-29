@@ -1,5 +1,10 @@
 import os
 import logging
+import itertools
+import queue
+import threading
+import time
+import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from services.youtube_service import YouTubeService
@@ -7,123 +12,133 @@ from services.acrcloud_service import ACRCloudService
 from services.spotify_service import SpotifyService
 from services.brave_search_service import BraveSearchService
 from services.scan_logger import ScanLogger
- 
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
- 
+
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
- 
+
 # Initialize services
 youtube_service = YouTubeService()
 acrcloud_service = ACRCloudService()
 spotify_service = SpotifyService()
 brave_search_service = BraveSearchService()
- 
- 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'message': 'BeatLink API is running',
-        'version': '2.0.0'
-    }), 200
- 
- 
-@app.route('/scan', methods=['POST'])
-def scan_beat():
-    """
-    Main endpoint to scan a YouTube Type Beat
-    
-    Expected JSON body:
-    {
-        "youtube_url": "https://www.youtube.com/watch?v=..."
-    }
-    
-    Returns:
-    {
-        "success": true/false,
-        "uploaded_beat": {...},
-        "matched_songs": [...],
-        "results_count": int
-    }
-    """
-    # Parse the body up front so we can build the scan logger (scan_id correlates these
-    # logs to the uploaded_beat the frontend creates after the scan).
-    data = request.get_json(silent=True) or {}
-    youtube_url = data.get('youtube_url')
-    scan_id = data.get('scan_id')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Priority scan queue
+#
+# /scan used to run the whole pipeline (download → identify → enrich) inline in
+# the request handler. That's fine one at a time, but under concurrent load every
+# request — including a cheap status poll — was stuck behind whatever gunicorn
+# thread was mid-scan, and there was no way to make a paying tier's scan jump
+# ahead of a free/demo one; requests were just served in whatever order the OS
+# handed them to gunicorn's 4 gthread workers.
+#
+# This splits the two concerns: /scan now only validates + enqueues a job and
+# returns immediately (fast, cheap — never blocks on external APIs), while a
+# small fixed pool of background worker threads pulls jobs off a priority queue
+# and does the actual slow work. The frontend polls /scan/status/<job_id>.
+#
+# Deliberately in-process (no Redis/Celery): jobs live in memory, so a Render
+# restart mid-scan loses anything still queued or running — acceptable at
+# current volume, and a lost scan just gets re-submitted. NUM_WORKERS matches
+# gunicorn's existing `--threads 4`, so total concurrent scan work is unchanged
+# from before; only the queueing/prioritization in front of it is new.
+#
+# Priority is caller-supplied (the Next.js layer knows the user's plan; this
+# service has no auth of its own, same trust boundary /scan already had for
+# youtube_url). Mapped defensively across both the current plan ids and the
+# planned Starter/Pro/Ultimate rename, so this doesn't need touching again
+# when that ships — only the frontend's `plan` string does.
+PLAN_PRIORITY = {
+    'admin': 0,
+    'ultimate': 0, 'scale': 0,
+    'pro': 1, 'growth': 1,
+    'starter': 2, 'free': 2,
+}
+DEFAULT_PRIORITY = 3  # unauthenticated / demo / unrecognized plan — served last
+NUM_WORKERS = 4
+JOB_RETENTION_SECONDS = 60 * 60  # prune finished jobs after 1h so memory can't grow unbounded
+
+_jobs = {}
+_jobs_lock = threading.Lock()
+_job_queue = queue.PriorityQueue()
+_seq = itertools.count()  # tiebreaker so equal-priority jobs stay FIFO, and PriorityQueue
+                          # never has to compare two job dicts directly (they aren't orderable)
+
+
+def _prune_old_jobs():
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    with _jobs_lock:
+        stale = [jid for jid, j in _jobs.items() if j['status'] in ('done', 'error') and j['created_at'] < cutoff]
+        for jid in stale:
+            del _jobs[jid]
+
+
+def execute_scan(youtube_url, scan_id):
+    """The actual pipeline — unchanged from the old inline /scan handler, just
+    extracted so it can be called from a worker thread instead of the request
+    thread. Returns the same response body /scan always returned on success,
+    or raises on a hard failure (caught by the worker loop)."""
     scan_log = ScanLogger(scan_id, youtube_url)
-
     try:
-        if not youtube_url:
-            return jsonify({
-                'success': False,
-                'error': 'missing_url',
-                'message': 'youtube_url is required in request body'
-            }), 400
-
-        logger.info(f"📥 Scanning YouTube URL: {youtube_url}")
         scan_log.log('received', f'Scan requested for {youtube_url}', data={'scan_id': scan_id})
 
-        # Step 1: Get video metadata
         logger.info("⬇️ Step 1: Getting video metadata...")
         video_info = youtube_service.get_video_info(youtube_url)
 
         if not video_info['success']:
             scan_log.error('metadata', f"Metadata lookup failed: {video_info.get('message')}", data={'error': video_info.get('error')})
-            return jsonify({
+            return {
                 'success': False,
                 'error': video_info['error'],
-                'message': video_info['message']
-            }), 400
+                'message': video_info['message'],
+            }
 
         scan_log.log('metadata', f"Resolved \"{video_info['title']}\" by {video_info['author']}", data={
             'title': video_info['title'], 'author': video_info['author'], 'views': video_info['views'],
         })
 
-        # Step 2: Download audio via Apify
         logger.info("🎵 Step 2: Downloading audio via Apify...")
         audio_path = youtube_service.download_audio(youtube_url)
 
         if not audio_path:
             scan_log.error('download', 'Audio download failed (no file returned)')
-            return jsonify({
+            return {
                 'success': False,
                 'error': 'download_failed',
-                'message': 'Failed to download audio from YouTube'
-            }), 500
+                'message': 'Failed to download audio from YouTube',
+            }
 
         scan_log.log('download', 'Audio downloaded')
 
-        # Step 3: Identify audio with ACR Cloud
         logger.info("🔍 Step 3: Identifying audio with ACR Cloud...")
         matches = acrcloud_service.identify_audio(audio_path)
 
-        # Clean up audio file
         youtube_service.cleanup_audio(audio_path)
 
         if not matches:
             logger.info("ℹ️ No matches found in ACR Cloud")
             scan_log.warn('acrcloud', 'ACRCloud returned 0 matches — no buyers for this beat')
-            return jsonify({
+            return {
                 'success': True,
                 'uploaded_beat': {
                     'title': video_info['title'],
                     'author': video_info['author'],
                     'youtube_url': youtube_url,
                     'views_number': video_info['views'],
-                    'thumbnail': video_info['thumbnail']
+                    'thumbnail': video_info['thumbnail'],
                 },
                 'matched_songs': [],
-                'results_count': 0
-            }), 200
+                'results_count': 0,
+            }
 
         logger.info(f"✅ ACR Cloud found {len(matches)} matches")
         scan_log.log('acrcloud', f'ACRCloud found {len(matches)} raw match(es)', data={
@@ -131,16 +146,12 @@ def scan_beat():
             'titles': [m.get('title') for m in matches][:20],
         })
 
-        # Step 4: Enrich with Spotify metadata
         logger.info("🎵 Step 4: Enriching with Spotify metadata...")
         enriched_songs = spotify_service.enrich_tracks(matches)
 
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
         scan_log.log('spotify', f'Enriched {len(enriched_songs)} song(s) with Spotify data', data={'count': len(enriched_songs)})
 
-        # FILTER: Keep only songs with complete Spotify data
-        # Ghost artist rule: only drop when RapidAPI *succeeded* and confirmed 0 published tracks.
-        # If RapidAPI failed (401, timeout…), has_discography defaults to True (benefit of doubt).
         filtered_songs = [
             song for song in enriched_songs
             if song.get('spotify_url')
@@ -148,7 +159,6 @@ def scan_beat():
             and song.get('has_discography', True)
         ]
 
-        # Record why each enriched song was kept or dropped, so a "why so few results?" is answerable.
         dropped = []
         for song in enriched_songs:
             reasons = []
@@ -167,30 +177,131 @@ def scan_beat():
         })
         scan_log.log('result', f'Scan complete — {len(filtered_songs)} buyer(s) returned', data={'results_count': len(filtered_songs)})
 
-        # Return results
-        return jsonify({
+        return {
             'success': True,
             'uploaded_beat': {
                 'title': video_info['title'],
                 'author': video_info['author'],
                 'youtube_url': youtube_url,
                 'views_number': video_info['views'],
-                'thumbnail': video_info['thumbnail']
+                'thumbnail': video_info['thumbnail'],
             },
             'matched_songs': filtered_songs,
-            'results_count': len(filtered_songs)
-        }), 200
-
-    except Exception as e:
-        logger.error(f"❌ Unexpected error: {str(e)}", exc_info=True)
-        scan_log.error('error', f'Unexpected server error: {str(e)}')
-        return jsonify({
-            'success': False,
-            'error': 'internal_error',
-            'message': f'Internal server error: {str(e)}'
-        }), 500
+            'results_count': len(filtered_songs),
+        }
     finally:
         scan_log.flush()
+
+
+def _worker_loop():
+    while True:
+        priority, seq, job_id = _job_queue.get()
+        try:
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job is None:
+                    continue  # pruned/unknown — drop
+                job['status'] = 'running'
+                job['started_at'] = time.time()
+                youtube_url, scan_id = job['youtube_url'], job['scan_id']
+
+            try:
+                result = execute_scan(youtube_url, scan_id)
+                with _jobs_lock:
+                    job = _jobs.get(job_id)
+                    if job is not None:
+                        job['status'] = 'error' if result.get('success') is False else 'done'
+                        job['result'] = result
+                        job['finished_at'] = time.time()
+            except Exception as e:
+                logger.error(f"❌ Unexpected error in scan job {job_id}: {str(e)}", exc_info=True)
+                with _jobs_lock:
+                    job = _jobs.get(job_id)
+                    if job is not None:
+                        job['status'] = 'error'
+                        job['result'] = {
+                            'success': False,
+                            'error': 'internal_error',
+                            'message': f'Internal server error: {str(e)}',
+                        }
+                        job['finished_at'] = time.time()
+        finally:
+            _job_queue.task_done()
+
+
+for _ in range(NUM_WORKERS):
+    threading.Thread(target=_worker_loop, daemon=True).start()
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'message': 'BeatLink API is running',
+        'version': '2.0.0'
+    }), 200
+
+
+@app.route('/scan', methods=['POST'])
+def scan_beat():
+    """
+    Enqueue a scan of a YouTube Type Beat — returns immediately with a job_id;
+    poll GET /scan/status/<job_id> for the result.
+
+    Expected JSON body:
+    {
+        "youtube_url": "https://www.youtube.com/watch?v=...",
+        "scan_id": "optional, correlates scan_logs rows",
+        "plan": "optional, e.g. 'ultimate'/'pro'/'starter'/'free' — determines queue priority"
+    }
+
+    Returns (202):
+    { "success": true, "job_id": "..." }
+    """
+    data = request.get_json(silent=True) or {}
+    youtube_url = data.get('youtube_url')
+    scan_id = data.get('scan_id')
+    plan = data.get('plan')
+
+    if not youtube_url:
+        return jsonify({
+            'success': False,
+            'error': 'missing_url',
+            'message': 'youtube_url is required in request body',
+        }), 400
+
+    _prune_old_jobs()
+
+    job_id = uuid.uuid4().hex
+    priority = PLAN_PRIORITY.get(plan, DEFAULT_PRIORITY)
+    with _jobs_lock:
+        _jobs[job_id] = {
+            'status': 'queued',
+            'youtube_url': youtube_url,
+            'scan_id': scan_id,
+            'created_at': time.time(),
+            'started_at': None,
+            'finished_at': None,
+            'result': None,
+        }
+    _job_queue.put((priority, next(_seq), job_id))
+    logger.info(f"📥 Queued scan job {job_id} (priority={priority}) for {youtube_url}")
+
+    return jsonify({'success': True, 'job_id': job_id}), 202
+
+
+@app.route('/scan/status/<job_id>', methods=['GET'])
+def scan_status(job_id):
+    """Poll the result of a job enqueued via POST /scan."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return jsonify({'success': False, 'error': 'not_found', 'message': 'Unknown or expired job_id'}), 404
+        body = {'success': True, 'status': job['status']}
+        if job['status'] in ('done', 'error'):
+            body['result'] = job['result']
+        return jsonify(body), 200
 
 
 @app.route('/reveal-instagram', methods=['POST'])
