@@ -67,11 +67,60 @@ DEFAULT_PRIORITY = 3  # unauthenticated / demo / unrecognized plan — served la
 NUM_WORKERS = 4
 JOB_RETENTION_SECONDS = 60 * 60  # prune finished jobs after 1h so memory can't grow unbounded
 
+# A job that has been running longer than this is reported as failed. The thread can't be
+# killed from outside in Python, so this doesn't free the worker — it stops the API lying
+# to a client that would otherwise poll a dead job until its own timeout.
+MAX_JOB_SECONDS = 4 * 60
+# A job nobody has picked up in this long means there is no healthy consumer. Same
+# reasoning: say so instead of leaving the caller on a spinner.
+MAX_QUEUE_WAIT_SECONDS = 90
+# Ceiling for the rescue workers below. Four is the steady-state pool; the rest only ever
+# exist because something is wedged.
+MAX_WORKERS = 8
+
 _jobs = {}
 _jobs_lock = threading.Lock()
 _job_queue = queue.PriorityQueue()
 _seq = itertools.count()  # tiebreaker so equal-priority jobs stay FIFO, and PriorityQueue
                           # never has to compare two job dicts directly (they aren't orderable)
+
+_workers = []
+_workers_lock = threading.Lock()
+_busy = 0
+_busy_lock = threading.Lock()
+
+
+def _ensure_workers():
+    """Guarantee this PROCESS has live consumers, and add one if the pool is wedged.
+
+    Two failures this exists for, both of which produced the same symptom — a job that
+    sits at 'queued' forever while the service looks perfectly healthy:
+
+    1. Threads started at import belong to the process that did the importing. Under
+       gunicorn --preload that is the master, and the forked children serve requests with
+       an empty pool: every job is enqueued into a queue nobody is reading. Calling this
+       from the request path means whichever process accepts the POST is the one that
+       gets the workers.
+
+    2. A worker blocked forever inside an external call (a download with no timeout, a
+       provider that never answers) never returns to the queue. Four of those and the
+       service is permanently deaf while still returning 200 to everything. The rescue
+       branch below notices that every worker is busy while work is waiting, and adds one.
+    """
+    with _workers_lock:
+        _workers[:] = [t for t in _workers if t.is_alive()]
+        target = NUM_WORKERS
+        # Everyone busy and a queue that isn't empty: the pool can't drain itself.
+        if len(_workers) >= NUM_WORKERS and _busy >= len(_workers) and not _job_queue.empty():
+            target = min(MAX_WORKERS, len(_workers) + 1)
+            logger.warning(
+                f"⚠️ Scan pool saturated ({_busy} busy, {_job_queue.qsize()} queued) — "
+                f"adding a worker (now {target})"
+            )
+        while len(_workers) < target:
+            t = threading.Thread(target=_worker_loop, daemon=True)
+            t.start()
+            _workers.append(t)
 
 
 def _prune_old_jobs():
@@ -194,8 +243,20 @@ def execute_scan(youtube_url, scan_id):
 
 
 def _worker_loop():
+    global _busy
     while True:
-        priority, seq, job_id = _job_queue.get()
+        # Outside the try/finally on purpose: nothing here may raise, and if it somehow
+        # does, the outer guard below keeps the thread alive rather than silently
+        # removing a consumer from the pool for the rest of the process's life.
+        try:
+            priority, seq, job_id = _job_queue.get()
+        except Exception:
+            logger.error("❌ Scan queue read failed", exc_info=True)
+            time.sleep(1)
+            continue
+
+        with _busy_lock:
+            _busy += 1
         try:
             with _jobs_lock:
                 job = _jobs.get(job_id)
@@ -225,12 +286,17 @@ def _worker_loop():
                             'message': f'Internal server error: {str(e)}',
                         }
                         job['finished_at'] = time.time()
+        except Exception:
+            # The body above already catches per-job failures; this is the last line of
+            # defence so a bug in the bookkeeping can't end the thread.
+            logger.error("❌ Scan worker loop error", exc_info=True)
         finally:
+            with _busy_lock:
+                _busy -= 1
             _job_queue.task_done()
 
 
-for _ in range(NUM_WORKERS):
-    threading.Thread(target=_worker_loop, daemon=True).start()
+_ensure_workers()
 
 
 @app.route('/health', methods=['GET'])
@@ -286,22 +352,73 @@ def scan_beat():
             'result': None,
         }
     _job_queue.put((priority, next(_seq), job_id))
-    logger.info(f"📥 Queued scan job {job_id} (priority={priority}) for {youtube_url}")
+    # Before returning 202, guarantee this process actually has a consumer. Enqueuing into
+    # a queue nobody reads is the failure this whole mechanism exists to prevent.
+    _ensure_workers()
+    logger.info(
+        f"📥 Queued scan job {job_id} (priority={priority}, queued={_job_queue.qsize()}, "
+        f"busy={_busy}, workers={len(_workers)}) for {youtube_url}"
+    )
 
     return jsonify({'success': True, 'job_id': job_id}), 202
 
 
 @app.route('/scan/status/<job_id>', methods=['GET'])
 def scan_status(job_id):
-    """Poll the result of a job enqueued via POST /scan."""
+    """Poll the result of a job enqueued via POST /scan.
+
+    A job that has stopped making progress is reported as failed rather than left at
+    'queued' or 'running'. The caller can't tell the difference between slow and dead, so
+    saying nothing leaves it on a spinner until its own timeout — which is what an infinite
+    loading state actually is.
+    """
+    now = time.time()
     with _jobs_lock:
         job = _jobs.get(job_id)
         if job is None:
             return jsonify({'success': False, 'error': 'not_found', 'message': 'Unknown or expired job_id'}), 404
+
+        if job['status'] == 'queued' and now - job['created_at'] > MAX_QUEUE_WAIT_SECONDS:
+            logger.error(
+                f"❌ Job {job_id} waited {int(now - job['created_at'])}s without being picked up "
+                f"(queued={_job_queue.qsize()}, busy={_busy}, workers={len(_workers)})"
+            )
+            job['status'] = 'error'
+            job['finished_at'] = now
+            job['result'] = {
+                'success': False, 'error': 'queue_stalled',
+                'message': 'The scan service is busy. Please try again in a moment.',
+            }
+        elif job['status'] == 'running' and job['started_at'] and now - job['started_at'] > MAX_JOB_SECONDS:
+            logger.error(f"❌ Job {job_id} exceeded {MAX_JOB_SECONDS}s — reporting as timed out")
+            job['status'] = 'error'
+            job['finished_at'] = now
+            job['result'] = {
+                'success': False, 'error': 'scan_timeout',
+                'message': 'This scan took too long and was stopped. Please try again.',
+            }
+
         body = {'success': True, 'status': job['status']}
         if job['status'] in ('done', 'error'):
             body['result'] = job['result']
         return jsonify(body), 200
+
+
+@app.route('/scan/queue', methods=['GET'])
+def scan_queue():
+    """Operational view of the pool. There was no way to see that the queue had stalled
+    short of reading request logs and noticing the absence of pipeline output."""
+    with _workers_lock:
+        alive = sum(1 for t in _workers if t.is_alive())
+    with _jobs_lock:
+        by_status = {}
+        for j in _jobs.values():
+            by_status[j['status']] = by_status.get(j['status'], 0) + 1
+    return jsonify({
+        'queued': _job_queue.qsize(), 'busy': _busy,
+        'workers_alive': alive, 'workers_tracked': len(_workers),
+        'jobs': by_status,
+    }), 200
 
 
 @app.route('/reveal-instagram', methods=['POST'])
