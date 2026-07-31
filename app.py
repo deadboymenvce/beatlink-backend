@@ -1,7 +1,5 @@
 import os
 import logging
-import itertools
-import queue
 import threading
 import time
 import uuid
@@ -32,95 +30,50 @@ brave_search_service = BraveSearchService()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Priority scan queue
+# Background scans
 #
-# /scan used to run the whole pipeline (download → identify → enrich) inline in
-# the request handler. That's fine one at a time, but under concurrent load every
-# request — including a cheap status poll — was stuck behind whatever gunicorn
-# thread was mid-scan, and there was no way to make a paying tier's scan jump
-# ahead of a free/demo one; requests were just served in whatever order the OS
-# handed them to gunicorn's 4 gthread workers.
+# /scan validates, starts the pipeline on its own thread, and returns a job_id
+# immediately; the frontend polls /scan/status/<job_id>. That part works and stays.
 #
-# This splits the two concerns: /scan now only validates + enqueues a job and
-# returns immediately (fast, cheap — never blocks on external APIs), while a
-# small fixed pool of background worker threads pulls jobs off a priority queue
-# and does the actual slow work. The frontend polls /scan/status/<job_id>.
+# WHAT IS GONE, AND WHY
+# This used to be a shared queue.PriorityQueue drained by a pool of worker threads
+# started at import, so a paying tier could jump ahead of a free one. It broke the
+# scanner outright: jobs were accepted, logged, and never picked up, with the
+# service returning 200 to every poll while nothing ran. The last log before the
+# revert says it exactly — `queued=1, busy=0, workers=4`: four live threads, none
+# busy, one job waiting, nobody taking it. A module-level queue and threads started
+# at import don't survive gunicorn's fork the way a single process would; the
+# producer and the consumers ended up looking at different objects, and no amount
+# of respawning workers inside the request fixes a queue nobody is reading.
 #
-# Deliberately in-process (no Redis/Celery): jobs live in memory, so a Render
-# restart mid-scan loses anything still queued or running — acceptable at
-# current volume, and a lost scan just gets re-submitted. NUM_WORKERS matches
-# gunicorn's existing `--threads 4`, so total concurrent scan work is unchanged
-# from before; only the queueing/prioritization in front of it is new.
+# So there is no queue any more. Each scan gets its own thread, created inside the
+# request that asked for it, which is the one place we know is in the right process.
+# Nothing is shared between jobs except a semaphore that caps how many run at once,
+# and a semaphore has no ordering to get wrong.
 #
-# Priority is caller-supplied (the Next.js layer knows the user's plan; this
-# service has no auth of its own, same trust boundary /scan already had for
-# youtube_url). Mapped defensively across both the current plan ids and the
-# planned Starter/Pro/Ultimate rename, so this doesn't need touching again
-# when that ships — only the frontend's `plan` string does.
-PLAN_PRIORITY = {
-    'admin': 0,
-    'ultimate': 0, 'scale': 0,
-    'pro': 1, 'growth': 1,
-    'starter': 2, 'free': 2,
-}
-DEFAULT_PRIORITY = 3  # unauthenticated / demo / unrecognized plan — served last
-NUM_WORKERS = 4
-JOB_RETENTION_SECONDS = 60 * 60  # prune finished jobs after 1h so memory can't grow unbounded
+# Priority went with it. At current volume it was ordering a queue that was almost
+# always empty, and it is the feature that took the scanner down. If it comes back
+# it belongs in a real broker (Redis/Celery) with the queue outside the process,
+# not in application memory shared across forked workers.
+#
+# Jobs still live in memory, so a Render restart mid-scan loses them — same trade as
+# before, and a lost scan just gets re-submitted.
 
-# A job that has been running longer than this is reported as failed. The thread can't be
-# killed from outside in Python, so this doesn't free the worker — it stops the API lying
-# to a client that would otherwise poll a dead job until its own timeout.
-MAX_JOB_SECONDS = 4 * 60
-# A job nobody has picked up in this long means there is no healthy consumer. Same
-# reasoning: say so instead of leaving the caller on a spinner.
+# Concurrent scans. Matches gunicorn's --threads 4, so total in-flight work is what
+# it has always been; the semaphore only stops a burst from opening twenty of them.
+MAX_CONCURRENT_SCANS = 4
+# How long a job will wait for a free slot before giving up. Past this the caller is
+# told the service is busy instead of being left on a spinner.
 MAX_QUEUE_WAIT_SECONDS = 90
-# Ceiling for the rescue workers below. Four is the steady-state pool; the rest only ever
-# exist because something is wedged.
-MAX_WORKERS = 8
+# A job running longer than this is reported as failed. The thread can't be killed
+# from outside in Python, so this doesn't free the slot — it stops the API telling a
+# caller that something is still working when it has clearly stopped.
+MAX_JOB_SECONDS = 4 * 60
+JOB_RETENTION_SECONDS = 60 * 60  # prune finished jobs after 1h so memory can't grow unbounded
 
 _jobs = {}
 _jobs_lock = threading.Lock()
-_job_queue = queue.PriorityQueue()
-_seq = itertools.count()  # tiebreaker so equal-priority jobs stay FIFO, and PriorityQueue
-                          # never has to compare two job dicts directly (they aren't orderable)
-
-_workers = []
-_workers_lock = threading.Lock()
-_busy = 0
-_busy_lock = threading.Lock()
-
-
-def _ensure_workers():
-    """Guarantee this PROCESS has live consumers, and add one if the pool is wedged.
-
-    Two failures this exists for, both of which produced the same symptom — a job that
-    sits at 'queued' forever while the service looks perfectly healthy:
-
-    1. Threads started at import belong to the process that did the importing. Under
-       gunicorn --preload that is the master, and the forked children serve requests with
-       an empty pool: every job is enqueued into a queue nobody is reading. Calling this
-       from the request path means whichever process accepts the POST is the one that
-       gets the workers.
-
-    2. A worker blocked forever inside an external call (a download with no timeout, a
-       provider that never answers) never returns to the queue. Four of those and the
-       service is permanently deaf while still returning 200 to everything. The rescue
-       branch below notices that every worker is busy while work is waiting, and adds one.
-    """
-    with _workers_lock:
-        _workers[:] = [t for t in _workers if t.is_alive()]
-        target = NUM_WORKERS
-        # Everyone busy and a queue that isn't empty: the pool can't drain itself.
-        if len(_workers) >= NUM_WORKERS and _busy >= len(_workers) and not _job_queue.empty():
-            target = min(MAX_WORKERS, len(_workers) + 1)
-            logger.warning(
-                f"⚠️ Scan pool saturated ({_busy} busy, {_job_queue.qsize()} queued) — "
-                f"adding a worker (now {target})"
-            )
-        while len(_workers) < target:
-            t = threading.Thread(target=_worker_loop, daemon=True)
-            t.start()
-            _workers.append(t)
+_scan_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
 
 
 def _prune_old_jobs():
@@ -242,61 +195,54 @@ def execute_scan(youtube_url, scan_id):
         scan_log.flush()
 
 
-def _worker_loop():
-    global _busy
-    while True:
-        # Outside the try/finally on purpose: nothing here may raise, and if it somehow
-        # does, the outer guard below keeps the thread alive rather than silently
-        # removing a consumer from the pool for the rest of the process's life.
-        try:
-            priority, seq, job_id = _job_queue.get()
-        except Exception:
-            logger.error("❌ Scan queue read failed", exc_info=True)
-            time.sleep(1)
-            continue
+def _run_job(job_id):
+    """One scan, on its own thread. Everything it touches is either local or the
+    job's own dict, so there is no shared structure that can be left in a state
+    where work is accepted but never performed."""
+    if not _scan_slots.acquire(timeout=MAX_QUEUE_WAIT_SECONDS):
+        logger.error(f"❌ Job {job_id} found no free slot in {MAX_QUEUE_WAIT_SECONDS}s")
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job is not None:
+                job['status'] = 'error'
+                job['finished_at'] = time.time()
+                job['result'] = {
+                    'success': False, 'error': 'queue_stalled',
+                    'message': 'The scan service is busy. Please try again in a moment.',
+                }
+        return
 
-        with _busy_lock:
-            _busy += 1
+    try:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job is None:
+                return  # pruned/unknown — drop
+            job['status'] = 'running'
+            job['started_at'] = time.time()
+            youtube_url, scan_id = job['youtube_url'], job['scan_id']
+
         try:
+            result = execute_scan(youtube_url, scan_id)
             with _jobs_lock:
                 job = _jobs.get(job_id)
-                if job is None:
-                    continue  # pruned/unknown — drop
-                job['status'] = 'running'
-                job['started_at'] = time.time()
-                youtube_url, scan_id = job['youtube_url'], job['scan_id']
-
-            try:
-                result = execute_scan(youtube_url, scan_id)
-                with _jobs_lock:
-                    job = _jobs.get(job_id)
-                    if job is not None:
-                        job['status'] = 'error' if result.get('success') is False else 'done'
-                        job['result'] = result
-                        job['finished_at'] = time.time()
-            except Exception as e:
-                logger.error(f"❌ Unexpected error in scan job {job_id}: {str(e)}", exc_info=True)
-                with _jobs_lock:
-                    job = _jobs.get(job_id)
-                    if job is not None:
-                        job['status'] = 'error'
-                        job['result'] = {
-                            'success': False,
-                            'error': 'internal_error',
-                            'message': f'Internal server error: {str(e)}',
-                        }
-                        job['finished_at'] = time.time()
-        except Exception:
-            # The body above already catches per-job failures; this is the last line of
-            # defence so a bug in the bookkeeping can't end the thread.
-            logger.error("❌ Scan worker loop error", exc_info=True)
-        finally:
-            with _busy_lock:
-                _busy -= 1
-            _job_queue.task_done()
-
-
-_ensure_workers()
+                if job is not None:
+                    job['status'] = 'error' if result.get('success') is False else 'done'
+                    job['result'] = result
+                    job['finished_at'] = time.time()
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in scan job {job_id}: {str(e)}", exc_info=True)
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job is not None:
+                    job['status'] = 'error'
+                    job['result'] = {
+                        'success': False,
+                        'error': 'internal_error',
+                        'message': f'Internal server error: {str(e)}',
+                    }
+                    job['finished_at'] = time.time()
+    finally:
+        _scan_slots.release()
 
 
 @app.route('/health', methods=['GET'])
@@ -340,7 +286,6 @@ def scan_beat():
     _prune_old_jobs()
 
     job_id = uuid.uuid4().hex
-    priority = PLAN_PRIORITY.get(plan, DEFAULT_PRIORITY)
     with _jobs_lock:
         _jobs[job_id] = {
             'status': 'queued',
@@ -351,14 +296,11 @@ def scan_beat():
             'finished_at': None,
             'result': None,
         }
-    _job_queue.put((priority, next(_seq), job_id))
-    # Before returning 202, guarantee this process actually has a consumer. Enqueuing into
-    # a queue nobody reads is the failure this whole mechanism exists to prevent.
-    _ensure_workers()
-    logger.info(
-        f"📥 Queued scan job {job_id} (priority={priority}, queued={_job_queue.qsize()}, "
-        f"busy={_busy}, workers={len(_workers)}) for {youtube_url}"
-    )
+    # Started here, in the process that accepted the request. That is the whole point:
+    # a thread created inside the request handler cannot end up on the wrong side of a
+    # fork from the work it is supposed to do.
+    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+    logger.info(f"📥 Started scan job {job_id} for {youtube_url}")
 
     return jsonify({'success': True, 'job_id': job_id}), 202
 
@@ -379,10 +321,7 @@ def scan_status(job_id):
             return jsonify({'success': False, 'error': 'not_found', 'message': 'Unknown or expired job_id'}), 404
 
         if job['status'] == 'queued' and now - job['created_at'] > MAX_QUEUE_WAIT_SECONDS:
-            logger.error(
-                f"❌ Job {job_id} waited {int(now - job['created_at'])}s without being picked up "
-                f"(queued={_job_queue.qsize()}, busy={_busy}, workers={len(_workers)})"
-            )
+            logger.error(f"❌ Job {job_id} waited {int(now - job['created_at'])}s without starting")
             job['status'] = 'error'
             job['finished_at'] = now
             job['result'] = {
@@ -406,17 +345,14 @@ def scan_status(job_id):
 
 @app.route('/scan/queue', methods=['GET'])
 def scan_queue():
-    """Operational view of the pool. There was no way to see that the queue had stalled
-    short of reading request logs and noticing the absence of pipeline output."""
-    with _workers_lock:
-        alive = sum(1 for t in _workers if t.is_alive())
+    """Operational view. The failure this replaces was invisible from outside: the
+    service answered 200 to everything while doing nothing at all."""
     with _jobs_lock:
         by_status = {}
         for j in _jobs.values():
             by_status[j['status']] = by_status.get(j['status'], 0) + 1
     return jsonify({
-        'queued': _job_queue.qsize(), 'busy': _busy,
-        'workers_alive': alive, 'workers_tracked': len(_workers),
+        'max_concurrent': MAX_CONCURRENT_SCANS,
         'jobs': by_status,
     }), 200
 
