@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 PARTIAL_CAP_BYTES = 1_500_000
 
 
+def _iso8601_seconds(duration):
+    """PT4M13S → 253. Returns 0 for anything unparseable, which drops the video rather
+    than letting an unknown length through as if it were a full beat."""
+    m = re.match(r'^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$', duration or '')
+    if not m:
+        return 0
+    d, h, mi, sec = (int(x) if x else 0 for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + sec
+
+
 class YouTubeService:
     """
     YouTube service using:
@@ -64,6 +74,94 @@ class YouTubeService:
             if match:
                 return match.group(1)
         return None
+
+    def search_type_beats(self, niche, published_after, min_views=30000, want=10):
+        """Find the most-watched "{niche} type beat" videos published since a date.
+
+        Used to auto-fill the scanner's suggestions for a niche nobody has curated by
+        hand. Ordered by view count, never by date: views are the only signal available
+        up front that a beat had enough reach to have real buyers behind it.
+
+        QUOTA — the reason this must never be called per user. search.list costs 100 units
+        against a 10,000/day quota, while the videos.list below and every scan's metadata
+        lookup cost 1. One careless call per session would starve the scanner itself, so
+        the caller is expected to cache the result per niche, not per user.
+
+        Two calls on purpose: search.list won't return view counts, so the ids it gives
+        back are re-read through videos.list (1 unit for up to 50) to get statistics and
+        duration. That is also what lets Shorts be dropped — a 40-second clip is not a
+        beat anyone bought.
+        """
+        if not self.api_key:
+            return {'success': False, 'error': 'missing_api_key', 'message': 'YOUTUBE_API_KEY non configurée'}
+
+        query = f"{niche} type beat".strip()
+        try:
+            search = requests.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "part": "id",
+                    "type": "video",
+                    "q": query,
+                    "order": "viewCount",
+                    "publishedAfter": published_after,
+                    "maxResults": 50,
+                    "key": self.api_key,
+                },
+                timeout=20,
+            )
+            record_api_usage('youtube-data-api', search.headers)
+            if search.status_code != 200:
+                logger.error(f"❌ YouTube search failed ({search.status_code}) for '{query}': {search.text[:300]}")
+                return {'success': False, 'error': 'api_error', 'message': f'YouTube search error: {search.status_code}'}
+
+            ids = [i['id']['videoId'] for i in search.json().get('items', []) if i.get('id', {}).get('videoId')]
+            if not ids:
+                return {'success': True, 'query': query, 'videos': []}
+
+            details = requests.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={
+                    "id": ",".join(ids[:50]),
+                    "part": "snippet,statistics,contentDetails",
+                    "key": self.api_key,
+                },
+                timeout=20,
+            )
+            record_api_usage('youtube-data-api', details.headers)
+            if details.status_code != 200:
+                logger.error(f"❌ YouTube videos lookup failed ({details.status_code})")
+                return {'success': False, 'error': 'api_error', 'message': f'YouTube API error: {details.status_code}'}
+
+            out = []
+            for item in details.json().get('items', []):
+                stats = item.get('statistics', {})
+                snip = item.get('snippet', {})
+                views = int(stats.get('viewCount', 0) or 0)
+                if views < min_views:
+                    continue
+                if _iso8601_seconds(item.get('contentDetails', {}).get('duration', '')) < 90:
+                    continue  # Short / teaser, not a beat
+                thumbs = snip.get('thumbnails', {})
+                thumb = (thumbs.get('high') or thumbs.get('medium') or thumbs.get('default') or {}).get('url')
+                out.append({
+                    'video_id': item['id'],
+                    'youtube_url': f"https://www.youtube.com/watch?v={item['id']}",
+                    'title': snip.get('title'),
+                    'author': snip.get('channelTitle'),
+                    'thumbnail_url': thumb,
+                    'views_number': views,
+                    'published_at': snip.get('publishedAt'),
+                })
+
+            out.sort(key=lambda v: v['views_number'], reverse=True)
+            logger.info(f"🔎 '{query}' → {len(out)} usable of {len(ids)} results (min {min_views} views)")
+            return {'success': True, 'query': query, 'videos': out[:want]}
+
+        except Exception as e:
+            logger.error(f"❌ YouTube search error for '{query}': {e}", exc_info=True)
+            return {'success': False, 'error': 'search_failed', 'message': str(e)}
+
 
     def get_video_info(self, youtube_url):
         """

@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+from datetime import datetime
 import time
 import uuid
 from flask import Flask, request, jsonify
@@ -355,6 +356,32 @@ def scan_queue():
         'max_concurrent': MAX_CONCURRENT_SCANS,
         'jobs': by_status,
     }), 200
+
+
+@app.route('/youtube/search', methods=['GET'])
+def youtube_search():
+    """Most-watched "{niche} type beat" videos, for the scanner's auto-suggestions.
+
+    Deliberately stateless: this service owns the YouTube key, the Next.js layer owns the
+    database and the caching. Keeping the cache on that side is not a detail — search.list
+    costs 100 quota units against a daily 10,000, so this must be called once per niche per
+    day, never once per user. See YouTubeService.search_type_beats.
+
+    Query: ?niche=trap&published_after=2026-01-01T00:00:00Z&min_views=30000&limit=10
+    """
+    niche = (request.args.get('niche') or '').strip()
+    if not niche:
+        return jsonify({'success': False, 'error': 'missing_niche', 'message': 'niche is required'}), 400
+
+    published_after = request.args.get('published_after') or f"{datetime.utcnow().year}-01-01T00:00:00Z"
+    try:
+        min_views = max(0, int(request.args.get('min_views', 30000)))
+        limit = max(1, min(25, int(request.args.get('limit', 10))))
+    except ValueError:
+        return jsonify({'success': False, 'error': 'bad_params', 'message': 'min_views and limit must be integers'}), 400
+
+    result = youtube_service.search_type_beats(niche, published_after, min_views=min_views, want=limit)
+    return jsonify(result), 200 if result.get('success') else 502
 
 
 @app.route('/reveal-instagram', methods=['POST'])
