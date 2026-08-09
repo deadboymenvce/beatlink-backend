@@ -16,19 +16,6 @@ logger = logging.getLogger(__name__)
 # rate-limit blips rather than triggering a storm of them.
 ENRICH_MAX_WORKERS = 4
 
-# Below this Spotify track `popularity` (0-100, free — comes back on every official
-# /v1/tracks/{id} call we already make), skip the PAID RapidAPI artist lookup entirely
-# rather than spend a request confirming what popularity already all but told us: this
-# track's artist has ~no audience. Added 2026-08-09 when real-time-spotify-data-scraper
-# hit 60/500 remaining for the cycle — a real 2026-08 sample of one Growth account's CRM
-# showed 80.6% of matched artists under 100 monthly listeners (median 12), so most of
-# what this quota was being spent on was confirming near-zero artists one paid call at a
-# time. 3 is a deliberately conservative starting point (skip only the most obviously
-# dead tracks) — there's no hard mapping from track popularity to monthly listeners yet,
-# so watch api_usage_status over the next few days and raise this if the burn rate is
-# still too high, or lower it if real finds are getting skipped.
-MIN_POPULARITY_FOR_RAPIDAPI = 3
-
 
 class SpotifyService:
     """Service to enrich track metadata using Spotify API + RapidAPI scraping"""
@@ -173,11 +160,7 @@ class SpotifyService:
                 'release_date': release_date,
                 'spotify_author_ID': spotify_author_id,
                 'artist_name': artist_name,
-                'label': label,
-                # 0-100, free — Spotify's own relevance score for this track. Used to skip
-                # the paid RapidAPI artist lookup for obviously dead tracks (see
-                # MIN_POPULARITY_FOR_RAPIDAPI).
-                'popularity': data.get('popularity', 0)
+                'label': label
             }
             
         except Exception as e:
@@ -612,13 +595,12 @@ class SpotifyService:
 
             enriched.append(enriched_track)
 
-            # Collect artist ID + name + this track's popularity for RapidAPI scraping
-            # (name feeds the Instagram Google Search fallback — from Spotify's official
-            # API, not the raw ACR Cloud credit string, which can hold multiple/feat.
-            # artists).
+            # Collect artist ID + name for RapidAPI scraping (name feeds the Instagram
+            # Google Search fallback — from Spotify's official API, not the raw ACR
+            # Cloud credit string, which can hold multiple/feat. artists).
             artist_id = details.get('spotify_author_ID')
             if artist_id:
-                artist_ids_to_fetch.append((artist_id, details.get('artist_name'), details.get('popularity') or 0))
+                artist_ids_to_fetch.append((artist_id, details.get('artist_name')))
 
         logger.info(f"✅ Enriched {len(enriched)} tracks with Spotify API data")
 
@@ -633,43 +615,15 @@ class SpotifyService:
         # halving the calls on scans with repeat artists, statistically cuts exposure to
         # the RapidAPI 401 flakiness investigated 2026-07-28 too.
         if artist_ids_to_fetch:
-            # Dedup by artist id, keeping the HIGHEST popularity seen across that artist's
-            # matched tracks — one dead deep cut shouldn't veto a real lookup for the same
-            # artist if another matched track of theirs actually has an audience.
-            best_by_id = {}
-            for aid, name, pop in artist_ids_to_fetch:
-                if aid not in best_by_id or pop > best_by_id[aid][1]:
-                    best_by_id[aid] = (name, pop)
-            unique_pairs = [(aid, name, pop) for aid, (name, pop) in best_by_id.items()]
+            unique_pairs = list({aid: (aid, name) for aid, name in artist_ids_to_fetch}.values())
+            logger.info(f"🔍 Fetching {len(unique_pairs)} unique artist(s) data ({len(artist_ids_to_fetch)} track references, parallel)...")
 
-            to_fetch = [(aid, name) for aid, name, pop in unique_pairs if pop >= MIN_POPULARITY_FOR_RAPIDAPI]
-            skipped = [aid for aid, name, pop in unique_pairs if pop < MIN_POPULARITY_FOR_RAPIDAPI]
-            logger.info(
-                f"🔍 Fetching {len(to_fetch)} unique artist(s) data ({len(artist_ids_to_fetch)} track references, parallel)"
-                f"{f' — {len(skipped)} skipped (popularity < {MIN_POPULARITY_FOR_RAPIDAPI})' if skipped else ''}..."
-            )
-
-            scraped_by_id = {}
-            if to_fetch:
-                with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as ex:
-                    scraped_list = list(ex.map(
-                        lambda pair: self._get_artist_data_with_cache(pair[0], pair[1]),
-                        to_fetch
-                    ))
-                scraped_by_id = {pair[0]: data for pair, data in zip(to_fetch, scraped_list)}
-
-            # Skipped artists still show up in results (has_discography defaults True below
-            # so app.py's filter doesn't drop them) — just with no listener count and no
-            # contact, same as any other lookup we genuinely don't have data for.
-            # low_signal stays False on purpose: that flag means "RapidAPI confirmed this
-            # is tiny", and we deliberately never asked here.
-            for aid in skipped:
-                scraped_by_id[aid] = {
-                    'listeners': 0, 'city': None, 'instagram_url': None, 'twitter_url': None,
-                    'tiktok_url': None, 'email': None, 'low_signal': False, 'last_release_date': None,
-                    'artist_image': None, 'has_discography': True, '_rapidapi_ok': False,
-                    'instagram_via_google': False,
-                }
+            with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as ex:
+                scraped_list = list(ex.map(
+                    lambda pair: self._get_artist_data_with_cache(pair[0], pair[1]),
+                    unique_pairs
+                ))
+            scraped_by_id = {pair[0]: data for pair, data in zip(unique_pairs, scraped_list)}
 
             # Step 3: Merge scraped data with enriched tracks — looked up by the track's own
             # artist id, not a positional counter, so every track with the same artist gets
