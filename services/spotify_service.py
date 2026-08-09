@@ -25,6 +25,12 @@ class SpotifyService:
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         # Use dedicated RapidAPI key for Spotify Scraper (500/month - Compte B)
         self.rapidapi_key = os.getenv("RAPIDAPI_KEY_SPOTIFY")
+        # A second RapidAPI account's key for the same API (500/month), switched to once
+        # the primary key's quota is nearly spent — see _current_rapidapi_key(). Buys time
+        # against the cycle running dry, doesn't remove the underlying need to raise
+        # either account's tier eventually.
+        self.rapidapi_key_backup = os.getenv("RAPIDAPI_KEY_SPOTIFY_BACKUP")
+        self._using_backup_key = False
         # Instagram fallback when Spotify has no linked profile (1000/month budget)
         self.google_search_key = os.getenv("RAPIDAPI_KEY_GOOGLE_SEARCH")
         self.token = None
@@ -45,6 +51,39 @@ class SpotifyService:
             logger.info("✅ RAPIDAPI_KEY_GOOGLE_SEARCH configured (Instagram fallback)")
         else:
             logger.warning("⚠️ RAPIDAPI_KEY_GOOGLE_SEARCH missing - no Instagram fallback for unlinked artists")
+
+        if self.rapidapi_key_backup:
+            logger.info("✅ RAPIDAPI_KEY_SPOTIFY_BACKUP configured (switches over once the primary key is nearly spent)")
+        else:
+            logger.info("ℹ️ RAPIDAPI_KEY_SPOTIFY_BACKUP not set — no fallback if the primary key runs out this cycle")
+
+    def _current_rapidapi_key(self):
+        """
+        Which Spotify-scraper RapidAPI key to use right now. Starts on the primary key;
+        _note_rapidapi_quota (called after every real-time-spotify-data-scraper response)
+        flips this to the backup key the first time the primary's own X-RateLimit-Requests-
+        Remaining header reports 1 or fewer left — i.e. once it's actually about to run out,
+        not on a guess. Stays on the backup for the rest of this process's life once
+        flipped; there's no reset signal worth switching back on mid-cycle.
+        """
+        if self._using_backup_key and self.rapidapi_key_backup:
+            return self.rapidapi_key_backup
+        return self.rapidapi_key
+
+    def _note_rapidapi_quota(self, headers):
+        """Reads the same X-RateLimit-Requests-Remaining header record_api_usage already
+        persists, and flips to the backup key once the primary is down to its last
+        request. No-ops once already on the backup, or if no backup key is configured."""
+        if self._using_backup_key or not self.rapidapi_key_backup:
+            return
+        remaining = headers.get('X-RateLimit-Requests-Remaining')
+        try:
+            remaining = int(remaining)
+        except (TypeError, ValueError):
+            return
+        if remaining <= 1:
+            self._using_backup_key = True
+            logger.warning(f"⚠️ RAPIDAPI_KEY_SPOTIFY down to {remaining} request(s) left — switching to RAPIDAPI_KEY_SPOTIFY_BACKUP for the rest of this cycle")
 
     def _get_token(self):
         """Get Spotify API access token (client credentials flow)"""
@@ -184,13 +223,9 @@ class SpotifyService:
         if not self.rapidapi_key:
             logger.warning(f"⚠️ No RAPIDAPI_KEY_SPOTIFY - returning fallback for {artist_id}")
             return {'listeners': 0, 'city': None, 'instagram_url': None}
-        
+
         url = f"https://real-time-spotify-data-scraper.p.rapidapi.com/artist_overview/?id={artist_id}"
-        headers = {
-            'X-RapidAPI-Key': self.rapidapi_key,
-            'X-RapidAPI-Host': 'real-time-spotify-data-scraper.p.rapidapi.com'
-        }
-        
+
         # Retry logic. Bumped from 3 to 6 after 2026-07-28: production logs showed the 401
         # below is transient (same artist_id, same key, fails then succeeds seconds later
         # within the same process — a hard-dead subscription would fail every time, not
@@ -199,8 +234,17 @@ class SpotifyService:
         max_retries = 6
         for attempt in range(max_retries):
             try:
+                # Rebuilt every attempt (not once, up-front): if a key switch happens
+                # mid-retry (_note_rapidapi_quota fires after every response, including a
+                # 401/429), the very next retry of this same call already uses the new key
+                # instead of waiting for the next artist.
+                headers = {
+                    'X-RapidAPI-Key': self._current_rapidapi_key(),
+                    'X-RapidAPI-Host': 'real-time-spotify-data-scraper.p.rapidapi.com'
+                }
                 response = requests.get(url, headers=headers, timeout=10)
                 record_api_usage('real-time-spotify-data-scraper', response.headers)
+                self._note_rapidapi_quota(response.headers)
 
                 if response.status_code == 200:
                     data = response.json()
