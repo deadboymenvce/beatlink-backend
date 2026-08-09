@@ -260,9 +260,10 @@ class YouTubeService:
 
     def _fetch_raw_via_sync_api(self, video_id, raw_path, max_bytes=None):
         """
-        Primary provider: youtube-mp3-audio-video-downloader — one request, returns the
-        M4A binary directly (no polling). Fast (~30s observed) and simple: it either
-        works or it doesn't, so failures here are cheap and we move on quickly.
+        youtube-mp3-audio-video-downloader — one request, returns the M4A binary directly
+        (no polling). Fast (~30s observed) and simple: it either works or it doesn't, so
+        failures here are cheap and we move on quickly. Normally the primary provider, but
+        called second for now (see download_audio) while its RapidAPI quota is tight.
         When max_bytes is set, stops reading once that many bytes are on disk (partial
         download — see PARTIAL_CAP_BYTES). Returns True if raw_path was written.
         """
@@ -310,9 +311,10 @@ class YouTubeService:
 
     def _fetch_raw_via_cdn_api(self, video_id, raw_path, max_bytes=None):
         """
-        Fallback provider: youtube-mp3-2025 — async, on-demand transcode. Hands back a
-        CDN link that 504s ("not ready") until conversion finishes, so this polls:
-        re-requesting a fresh link a few times and retrying the CDN with backoff.
+        youtube-mp3-2025 — async, on-demand transcode. Hands back a CDN link that 504s
+        ("not ready") until conversion finishes, so this polls: re-requesting a fresh link
+        a few times and retrying the CDN with backoff. Normally the fallback provider, but
+        called first for now (see download_audio) to spare the sync provider's tight quota.
         When max_bytes is set, stops reading once that many bytes are on disk (partial
         download). Returns True if raw_path was written, False otherwise (never raises).
         """
@@ -458,11 +460,13 @@ class YouTubeService:
 
     def download_audio(self, youtube_url):
         """
-        Get a 30s M4A slice for ACRCloud. Sequential, sync-provider first: the direct-M4A
-        provider is privileged and the slower CDN-polling provider is only touched if the
-        sync one fails — so a normal scan never burns CDN quota or spins a wasted background
-        download (which the earlier parallel version did on every scan). Only a partial
-        slice of the file is pulled, not the whole track.
+        Get a 30s M4A slice for ACRCloud. Sequential, CDN-provider first: as of 2026-08-09
+        the sync provider's RapidAPI quota was down to ~12/100 requests for the cycle, so
+        priority is flipped to spare it — the slower CDN-polling provider now goes first,
+        and the fast sync one is only touched as a fallback if the CDN one fails. Flip this
+        back to sync-first once the sync provider's quota has real headroom again (it's the
+        faster, more reliable path when both are healthy). Only a partial slice of the file
+        is pulled, not the whole track.
 
         If the partial file can't be decoded (its M4A moov atom sat past the cut), we
         re-download the FULL file from whichever provider won and extract from that — so
@@ -488,15 +492,15 @@ class YouTubeService:
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
 
-            # Privilege the fast direct-M4A provider; only fall back to the slow CDN one
-            # if it actually fails.
+            # Privilege the CDN provider while the sync provider's quota is tight; only
+            # fall back to sync if the CDN one actually fails.
             winner = None
-            if self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
-                winner = 'sync'
+            if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                winner = 'cdn'
             else:
-                logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
-                if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
-                    winner = 'cdn'
+                logger.warning("⚠️ CDN provider failed — falling back to sync provider...")
+                if self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                    winner = 'sync'
 
             if not winner:
                 logger.error("❌ Both audio providers failed")
