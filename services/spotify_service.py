@@ -424,18 +424,45 @@ class SpotifyService:
             '_rapidapi_ok': False
         }
 
+    # Bio-link aggregator domains — a page listing an artist's own socials/contact, so
+    # anything pulled off one is trusted at "artist's own declaration" level, same as a
+    # Spotify bio.
+    _BIO_LINK_DOMAINS = ('linktr.ee', 'linktree.com', 'beacons.ai', 'bio.link', 'campsite.bio', 'lnk.bio', 'solo.to', 'msha.ke')
+
+    def _fetch_biolink_contacts(self, url):
+        """
+        Plain GET on a Linktree/Beacons/etc page — free, not a RapidAPI call, no quota
+        cost. Runs the raw HTML through the same regex contact parser already used for
+        Spotify bios (it matches platform URLs/emails regardless of surrounding markup).
+        Best-effort: any failure just means nothing extra was found, never raises.
+        """
+        try:
+            r = requests.get(url, timeout=6, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code != 200:
+                return {}
+            return extract_contacts(r.text)
+        except Exception as e:
+            logger.info(f"ℹ️ Bio-link fetch failed for {url}: {e}")
+            return {}
+
     def _search_instagram_google(self, artist_name):
         """
         Instagram fallback via RapidAPI Google Search — called only when Spotify's own
         scrape found no linked Instagram profile. Query mirrors the existing IG resolver
         convention: "{name} instagram". Budget: 1000 requests/month on this key.
 
-        Returns a profile URL (instagram.com/<username>) or None — deliberately skips
-        non-profile hits (/p/, /reel/, /stories/, /explore/…) since those are useless as
-        a contact link.
+        Also checks the SAME response for a bio-link page (Linktree, Beacons, …) among
+        the results Google already returned — no second search, no extra RapidAPI cost.
+        When one's found, fetches it (see _fetch_biolink_contacts) for whatever
+        Instagram/TikTok/email it lists.
+
+        Returns {'instagram_url': str|None, 'tiktok_url': str|None, 'email': str|None}.
+        The Instagram match deliberately skips non-profile hits (/p/, /reel/, /stories/,
+        /explore/…) since those are useless as a contact link.
         """
+        out = {'instagram_url': None, 'tiktok_url': None, 'email': None}
         if not self.google_search_key:
-            return None
+            return out
 
         url = "https://google-search116.p.rapidapi.com/"
         headers = {
@@ -444,6 +471,7 @@ class SpotifyService:
         }
         params = {'query': f"{artist_name} instagram"}
         profile_re = re.compile(r'^https?://(www\.)?instagram\.com/[^/?#]+/?(\?.*)?$', re.IGNORECASE)
+        biolink_re = re.compile(r'^https?://(www\.)?(' + '|'.join(re.escape(d) for d in self._BIO_LINK_DOMAINS) + r')/', re.IGNORECASE)
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -452,13 +480,26 @@ class SpotifyService:
 
                 if response.status_code == 200:
                     data = response.json()
+                    biolink_url = None
                     for result in (data.get('results') or []):
                         result_url = (result.get('url') or '').strip()
-                        if profile_re.match(result_url):
+                        if not out['instagram_url'] and profile_re.match(result_url):
+                            out['instagram_url'] = result_url
                             logger.info(f"✅ Google Search found Instagram for '{artist_name}': {result_url}")
-                            return result_url
-                    logger.info(f"ℹ️ No Instagram profile in Google Search results for '{artist_name}'")
-                    return None
+                        if not biolink_url and biolink_re.match(result_url):
+                            biolink_url = result_url
+                    if not out['instagram_url']:
+                        logger.info(f"ℹ️ No Instagram profile in Google Search results for '{artist_name}'")
+                    if biolink_url:
+                        logger.info(f"🔗 Bio-link page found for '{artist_name}': {biolink_url}")
+                        bio_contacts = self._fetch_biolink_contacts(biolink_url)
+                        if not out['instagram_url'] and bio_contacts.get('instagram'):
+                            out['instagram_url'] = bio_contacts['instagram']
+                        if bio_contacts.get('tiktok'):
+                            out['tiktok_url'] = bio_contacts['tiktok']
+                        if bio_contacts.get('email'):
+                            out['email'] = bio_contacts['email']
+                    return out
 
                 elif response.status_code == 429:
                     if attempt < max_retries - 1:
@@ -466,31 +507,31 @@ class SpotifyService:
                         time.sleep(1)
                         continue
                     logger.error(f"❌ Google Search rate limit exhausted for '{artist_name}'")
-                    return None
+                    return out
 
                 elif response.status_code == 401:
                     logger.warning(f"⚠️ Google Search 401 for '{artist_name}' (attempt {attempt + 1}/{max_retries}) — check RAPIDAPI_KEY_GOOGLE_SEARCH / monthly quota")
                     if attempt < max_retries - 1:
                         time.sleep(2)
                         continue
-                    return None
+                    return out
 
                 else:
                     logger.error(f"❌ Google Search error {response.status_code} for '{artist_name}'")
-                    return None
+                    return out
 
             except requests.Timeout:
                 logger.error(f"❌ Google Search timeout for '{artist_name}' (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
                     time.sleep(0.5)
                     continue
-                return None
+                return out
 
             except Exception as e:
                 logger.error(f"❌ Google Search exception for '{artist_name}': {str(e)}")
-                return None
+                return out
 
-        return None
+        return out
 
     def _get_artist_data_with_cache(self, artist_id, artist_name=None):
         """
@@ -540,16 +581,25 @@ class SpotifyService:
             data['email'] = contacts['email']
 
         # Name-based Instagram search — LAST resort, and ONLY for artists we've CONFIRMED have
-        # >= 100 monthly listeners. Below that, "{name} instagram" mostly lands on the wrong
-        # account (small artists have poorly-differentiated names), so we skip it entirely
-        # rather than hand back a probably-wrong contact. Flagged instagram_via_google since
-        # this source is the least reliable (the frontend uses the flag to gate reporting).
+        # >= 15 monthly listeners (was 100 until 2026-08-10; a real sample showed 60 artists
+        # in the 20-99 band, 36 with zero contact today — lowered to bring those into reach).
+        # Below 15, "{name} instagram" mostly lands on the wrong account (small artists have
+        # poorly-differentiated names), so we skip it entirely rather than hand back a
+        # probably-wrong contact. Flagged instagram_via_google since this source is the
+        # least reliable (the frontend uses the flag to gate reporting).
         if (not data.get('instagram_url') and artist_name
-                and data.get('_rapidapi_ok') and (data.get('listeners') or 0) >= 100):
-            google_ig = self._search_instagram_google(artist_name)
-            if google_ig:
-                data['instagram_url'] = google_ig
+                and data.get('_rapidapi_ok') and (data.get('listeners') or 0) >= 15):
+            google_result = self._search_instagram_google(artist_name)
+            if google_result.get('instagram_url'):
+                data['instagram_url'] = google_result['instagram_url']
                 data['instagram_via_google'] = True
+            # Bio-link page (Linktree, Beacons, …) found among the SAME Google results —
+            # no second search. Only fills gaps, same "artist's own declaration" trust
+            # level as the Spotify-bio parse above, so not flagged instagram_via_google.
+            if not data.get('tiktok_url') and google_result.get('tiktok_url'):
+                data['tiktok_url'] = google_result['tiktok_url']
+            if not data.get('email') and google_result.get('email'):
+                data['email'] = google_result['email']
 
         # low_signal: a CONFIRMED sub-100 artist with NO reachable contact anywhere (no linked
         # or bio Instagram/Twitter/TikTok, no bio email). Not dropped — kept and flagged (shown
