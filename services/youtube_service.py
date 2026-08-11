@@ -7,6 +7,7 @@ import re
 import requests
 
 from services.api_usage_tracker import record_api_usage
+from services.key_rotation import KeyRotator
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ class YouTubeService:
         # the sync API above fails or is unavailable.
         # Hardcoded so a stale RAPIDAPI_HOST env can't point at the old endpoint.
         self.rapidapi_host = "youtube-mp3-2025.p.rapidapi.com"
+        # This provider (only — the sync one above stays on the single RAPIDAPI_KEY)
+        # waterfalls through the shared backup-account pool once RAPIDAPI_KEY's own quota
+        # is nearly spent. See services/key_rotation.py.
+        self.cdn_key_rotator = KeyRotator('youtube-mp3-2025', 'prodconnect@gmail.com', 'RAPIDAPI_KEY')
 
         if self.api_key:
             logger.info("✅ YOUTUBE_API_KEY configured")
@@ -318,10 +323,6 @@ class YouTubeService:
         When max_bytes is set, stops reading once that many bytes are on disk (partial
         download). Returns True if raw_path was written, False otherwise (never raises).
         """
-        headers = {
-            'x-rapidapi-key': self.rapidapi_key,
-            'x-rapidapi-host': self.rapidapi_host,
-        }
         info_url = f"https://{self.rapidapi_host}/v1/social/youtube/audio"
         # 64kbps instead of 128 — ACRCloud fingerprints, it doesn't listen, so half the
         # bitrate = ~half the bytes to transcode/transfer. If this provider ever rejects
@@ -348,11 +349,18 @@ class YouTubeService:
             if download_url is None and api_calls < 6:
                 api_calls += 1
                 try:
+                    # Rebuilt every call (not once, up-front): if note_response rotates to
+                    # the next account mid-poll, the very next call already uses it instead
+                    # of waiting for the next video.
+                    headers = {
+                        'x-rapidapi-key': self.cdn_key_rotator.current()[1],
+                        'x-rapidapi-host': self.rapidapi_host,
+                    }
                     logger.info(f"🚀 [cdn] Requesting audio link (call {api_calls}): id={video_id}")
                     info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
                     # Only this call goes through the RapidAPI gateway — the CDN download
                     # below hits a plain file link, no RapidAPI headers to record there.
-                    record_api_usage('youtube-mp3-2025', info_resp.headers)
+                    self.cdn_key_rotator.note_response(info_resp.headers)
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"⚠️ [cdn] API call {api_calls} failed: {e}")
                     time.sleep(5)

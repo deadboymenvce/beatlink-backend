@@ -22,10 +22,15 @@ _SUPABASE_URL = os.getenv("SUPABASE_URL")
 _SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 
-def record_api_usage(api_name, headers):
+def record_api_usage(api_name, headers, key_label=None):
     """
     api_name: stable identifier for the API, e.g. 'real-time-spotify-data-scraper'
     headers: the requests.Response.headers object (or any dict-like) from the call
+    key_label: which RapidAPI account/key made this call, e.g. an account email —
+        omit for APIs that only ever use one key. One row per (api_name, key_label),
+        so a multi-key API (see key_rotation.py) gets a separate row — and a separate
+        /settings progress bar — per key, instead of one row that gets overwritten
+        every time the backend rotates to the next key.
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return
@@ -47,6 +52,10 @@ def record_api_usage(api_name, headers):
 
     row = {
         "api_name": api_name,
+        # Never null — the column default ('default') exists so single-key APIs keep
+        # upserting onto the same row, but PostgREST sends this literally, so an
+        # explicit None here would ship as JSON null and defeat that default.
+        "key_label": key_label or "default",
         "limit_value": to_int(limit),
         "remaining": to_int(remaining),
         "reset_seconds": to_int(reset),
@@ -60,7 +69,7 @@ def record_api_usage(api_name, headers):
 
     try:
         requests.post(
-            f"{_SUPABASE_URL}/rest/v1/api_usage_status?on_conflict=api_name",
+            f"{_SUPABASE_URL}/rest/v1/api_usage_status?on_conflict=api_name,key_label",
             headers={
                 "apikey": _SUPABASE_KEY,
                 "Authorization": f"Bearer {_SUPABASE_KEY}",
@@ -71,4 +80,4 @@ def record_api_usage(api_name, headers):
             timeout=5,
         )
     except Exception as e:  # never let usage tracking break a real request
-        logger.warning(f"⚠️ api_usage_status upsert failed for {api_name}: {e}")
+        logger.warning(f"⚠️ api_usage_status upsert failed for {api_name} ({row['key_label']}): {e}")
