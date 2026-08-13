@@ -166,11 +166,21 @@ class ACRCloudService:
                 
                 artist_names = ', '.join(artist_names_list)
                 
-                # Get Spotify ID if available
+                # Platform links. Spotify stays the primary one (it is the only source that
+                # carries the artist page BeatLink scrapes for listeners/city/Instagram), but
+                # a match ACRCloud found through a non-Spotify database is still a real artist
+                # who used the beat — 39.6% of all matches were being discarded for having no
+                # Spotify link at all. Deezer and YouTube Music were enabled in the ACRCloud
+                # console on 2026-08-13; the ids come back under these keys.
                 external_metadata = music.get('external_metadata', {})
                 spotify_data = external_metadata.get('spotify', {})
                 spotify_track = spotify_data.get('track', {})
                 spotify_id = spotify_track.get('id', '')
+
+                deezer_track = external_metadata.get('deezer', {}).get('track', {})
+                deezer_id = str(deezer_track.get('id', '') or '')
+                # YouTube is the odd one out: a bare video id under 'vid', no nested track.
+                youtube_vid = str(external_metadata.get('youtube', {}).get('vid', '') or '')
 
                 # DEBUG: which platforms did ACRCloud actually return for this match?
                 # Lets us confirm whether dropped (no-Spotify) tracks carry deezer/youtube IDs
@@ -185,6 +195,8 @@ class ACRCloudService:
                     'title': title,
                     'artists': artist_names,
                     'spotify_id': f"spotify:track:{spotify_id}" if spotify_id else '',
+                    'deezer_id': deezer_id,
+                    'youtube_vid': youtube_vid,
                     'score': score
                 }
                 

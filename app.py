@@ -85,11 +85,22 @@ def _prune_old_jobs():
             del _jobs[jid]
 
 
-def execute_scan(youtube_url, scan_id):
+# Plans allowed to receive matches that came from a non-Spotify database (Deezer, YouTube
+# Music). Deliberately admin-only for now: those rows carry no Spotify artist page, so they
+# have no listeners, no Instagram and no email, and shipping contactless rows to a paying
+# producer would inflate the result count while lowering what the product actually delivers.
+# Widen this set only once alt-source rows have a contact path of their own.
+ALT_SOURCE_PLANS = {'admin'}
+
+
+def execute_scan(youtube_url, scan_id, plan=None):
     """The actual pipeline — unchanged from the old inline /scan handler, just
     extracted so it can be called from a worker thread instead of the request
     thread. Returns the same response body /scan always returned on success,
-    or raises on a hard failure (caught by the worker loop)."""
+    or raises on a hard failure (caught by the worker loop).
+
+    `plan` is the caller's current plan, used only to decide whether non-Spotify
+    matches are included (see ALT_SOURCE_PLANS)."""
     scan_log = ScanLogger(scan_id, youtube_url)
     try:
         scan_log.log('received', f'Scan requested for {youtube_url}', data={'scan_id': scan_id})
@@ -155,24 +166,45 @@ def execute_scan(youtube_url, scan_id):
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
         scan_log.log('spotify', f'Enriched {len(enriched_songs)} song(s) with Spotify data', data={'count': len(enriched_songs)})
 
-        filtered_songs = [
-            song for song in enriched_songs
-            if song.get('spotify_url')
-            and song.get('cover_url')
-            and song.get('has_discography', True)
-        ]
+        # A row qualifies either as a full Spotify result (unchanged rules: artist page
+        # resolved, cover art, and a real discography behind it), or — for the plans allowed
+        # alt sources — as a match that only a non-Spotify database could name. The
+        # ghost-artist rule is Spotify-only on purpose: has_discography is derived from the
+        # Spotify artist page, so a Deezer/YouTube row has nothing to be judged on and would
+        # be dropped for failing a test that was never run against it.
+        allow_alt = (plan or '') in ALT_SOURCE_PLANS
+
+        def qualifies(song):
+            if song.get('spotify_url'):
+                return bool(song.get('cover_url')) and song.get('has_discography', True)
+            return allow_alt and bool(song.get('source'))
+
+        filtered_songs = [song for song in enriched_songs if qualifies(song)]
 
         dropped = []
         for song in enriched_songs:
+            if qualifies(song):
+                continue
             reasons = []
             if not song.get('spotify_url'):
-                reasons.append('no Spotify URL')
-            if not song.get('cover_url'):
-                reasons.append('no cover')
-            if not song.get('has_discography', True):
-                reasons.append('ghost artist (0 published tracks)')
-            if reasons:
-                dropped.append({'name': song.get('artists') or song.get('title'), 'reasons': reasons})
+                if not song.get('source'):
+                    reasons.append('no platform link at all')
+                elif not allow_alt:
+                    reasons.append(f"{song.get('source')}-only (alt sources not enabled for this plan)")
+            else:
+                if not song.get('cover_url'):
+                    reasons.append('no cover')
+                if not song.get('has_discography', True):
+                    reasons.append('ghost artist (0 published tracks)')
+            dropped.append({'name': song.get('artists') or song.get('title'), 'reasons': reasons or ['unqualified']})
+
+        # Provenance breakdown, so the effect of enabling Deezer/YouTube Music is measurable
+        # from the scan logs instead of inferred.
+        by_source = {}
+        for song in filtered_songs:
+            key = song.get('source') or ('spotify' if song.get('spotify_url') else 'unknown')
+            by_source[key] = by_source.get(key, 0) + 1
+        scan_log.log('sources', f'Kept by source: {by_source}', data={'by_source': by_source, 'alt_enabled': allow_alt, 'plan': plan})
 
         logger.info(f"🔍 Filtered from {len(enriched_songs)} to {len(filtered_songs)} complete results")
         scan_log.log('filter', f'Kept {len(filtered_songs)} of {len(enriched_songs)} after the completeness/ghost-artist filter', data={
@@ -221,9 +253,10 @@ def _run_job(job_id):
             job['status'] = 'running'
             job['started_at'] = time.time()
             youtube_url, scan_id = job['youtube_url'], job['scan_id']
+            plan = job.get('plan')
 
         try:
-            result = execute_scan(youtube_url, scan_id)
+            result = execute_scan(youtube_url, scan_id, plan)
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job is not None:
@@ -292,6 +325,10 @@ def scan_beat():
             'status': 'queued',
             'youtube_url': youtube_url,
             'scan_id': scan_id,
+            # Carried through to execute_scan, which uses it to decide whether non-Spotify
+            # matches are returned (see ALT_SOURCE_PLANS). Previously read off the request
+            # and then dropped, since queue priority was the only thing it fed.
+            'plan': plan,
             'created_at': time.time(),
             'started_at': None,
             'finished_at': None,

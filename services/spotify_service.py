@@ -589,6 +589,21 @@ class SpotifyService:
 
         return data
 
+    def _deezer_cover(self, deezer_id):
+        """Album cover for a Deezer track. Deezer's public API needs no key and no auth, so
+        this adds a real cover to an alt-source row at zero API cost. Strictly best-effort:
+        a scan must never fail because Deezer was slow, so any error returns an empty cover
+        and the row survives without one."""
+        try:
+            r = requests.get(f"https://api.deezer.com/track/{deezer_id}", timeout=4)
+            if r.status_code != 200:
+                return ''
+            data = r.json() or {}
+            album = data.get('album') or {}
+            return album.get('cover_big') or album.get('cover_medium') or album.get('cover') or ''
+        except Exception:
+            return ''
+
     def enrich_tracks(self, matches):
         """
         Enrich ACR Cloud matches with Spotify metadata + RapidAPI artist data
@@ -618,15 +633,38 @@ class SpotifyService:
 
         for match, details in zip(matches, details_list):
             if details is None:
-                # ACR Cloud matched this track via a non-Spotify database (Gracenote, Deezer…)
-                # Without a Spotify track ID we cannot get artist data or cover art → will be filtered
-                logger.warning(f"⚠️ No Spotify ID for '{match['title']}' by {match['artists']} — will be dropped (ACR match without Spotify link)")
+                # ACR Cloud matched this track through a non-Spotify database. Until
+                # 2026-08-13 that meant the row was built empty and dropped downstream, which
+                # accounted for 39.6% of every match we ever found. It is still a real artist
+                # who used the beat, so the row is now built against whichever platform DID
+                # answer, and app.py decides whether the caller is allowed to see it.
+                #
+                # What these rows genuinely lack is the Spotify artist page, which is where
+                # listeners/city/Instagram come from — so those stay empty rather than faked,
+                # and the UI labels the row with its real source instead of implying Spotify.
+                source, source_url, cover_url = None, '', ''
+                if match.get('deezer_id'):
+                    source = 'deezer'
+                    source_url = f"https://www.deezer.com/track/{match['deezer_id']}"
+                    cover_url = self._deezer_cover(match['deezer_id'])
+                elif match.get('youtube_vid'):
+                    source = 'youtube'
+                    source_url = f"https://www.youtube.com/watch?v={match['youtube_vid']}"
+                    # Derived, not fetched: YouTube thumbnail URLs are addressable from the
+                    # video id alone, so this costs nothing and cannot fail at scan time.
+                    cover_url = f"https://img.youtube.com/vi/{match['youtube_vid']}/hqdefault.jpg"
+
+                if source:
+                    logger.info(f"🎯 '{match['title']}' by {match['artists']} kept via {source} (no Spotify link)")
+                else:
+                    logger.warning(f"⚠️ No platform link at all for '{match['title']}' by {match['artists']} — will be dropped")
+
                 enriched.append({
                     'title': match['title'],
                     'artists': match['artists'],
                     'spotify_url': '',
                     'spotify_author_ID': None,
-                    'cover_url': '',
+                    'cover_url': cover_url,
                     'release_date': None,
                     'score': match['score'],
                     'listeners': 0,
@@ -637,7 +675,9 @@ class SpotifyService:
                     'email': None,
                     'low_signal': False,
                     'last_release_date': None,
-                    'artist_image': None
+                    'artist_image': None,
+                    'source': source,
+                    'source_url': source_url,
                 })
                 continue
 
@@ -649,7 +689,11 @@ class SpotifyService:
                 'spotify_author_ID': details.get('spotify_author_ID'),
                 'cover_url': details.get('cover_url', ''),
                 'release_date': details.get('release_date'),
-                'score': match['score']
+                'score': match['score'],
+                # Stated explicitly rather than inferred from spotify_url being non-empty, so
+                # every row carries its own provenance and the UI never has to guess.
+                'source': 'spotify',
+                'source_url': details.get('spotify_url', ''),
             }
 
             enriched.append(enriched_track)
