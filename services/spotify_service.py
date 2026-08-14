@@ -786,20 +786,31 @@ class SpotifyService:
                 resolved = self._spotify_track_by_isrc(isrc) if isrc else {}
 
                 if resolved.get('spotify_author_ID'):
-                    logger.info(f"🔗 '{match['title']}' by {match['artists']} resolved to Spotify via ISRC {isrc} (found on {source})")
+                    # A match can carry an ISRC while having no platform link at all
+                    # (external_metadata empty, ACRCloud knowing only the recording code). It
+                    # still resolves perfectly, and the resulting row is every bit as complete
+                    # as a native Spotify one. Attributing it to Spotify is both the honest
+                    # answer (that IS where every field came from) and what keeps it from
+                    # being discarded: qualification requires a source, and leaving this None
+                    # silently binned two fully-resolved artists — contacts included — on the
+                    # 15:02 scan of 2026-08-14.
+                    resolved_source = source or 'spotify'
+                    resolved_source_url = source_url or resolved.get('spotify_url', '')
+                    logger.info(f"🔗 '{match['title']}' by {match['artists']} resolved to Spotify via ISRC {isrc} (found on {source or 'ISRC alone'})")
                     enriched.append({
                         'title': match['title'],
                         'artists': match['artists'],
-                        # Kept empty on purpose: `source` stays deezer/youtube so the card keeps
-                        # the branding of whatever actually identified the track, and app.py's
-                        # admin gate still applies. Only the ARTIST is borrowed from Spotify.
-                        'spotify_url': '',
+                        # Empty when another platform identified the track, so the card keeps
+                        # that platform's branding and app.py's admin gate still applies. Only
+                        # the ARTIST is borrowed from Spotify. When nothing else identified it,
+                        # the Spotify url is the only one there is, so it is used.
+                        'spotify_url': '' if source else resolved.get('spotify_url', ''),
                         'spotify_author_ID': resolved['spotify_author_ID'],
                         'cover_url': cover_url or resolved.get('cover_url', ''),
                         'release_date': resolved.get('release_date'),
                         'score': match['score'],
-                        'source': source,
-                        'source_url': source_url,
+                        'source': resolved_source,
+                        'source_url': resolved_source_url,
                         'isrc': isrc,
                     })
                     artist_ids_to_fetch.append((resolved['spotify_author_ID'], resolved.get('artist_name')))
