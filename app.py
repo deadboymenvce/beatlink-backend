@@ -85,12 +85,17 @@ def _prune_old_jobs():
             del _jobs[jid]
 
 
-# Plans allowed to receive matches that came from a non-Spotify database (Deezer, YouTube
-# Music). Deliberately admin-only for now: those rows carry no Spotify artist page, so they
-# have no listeners, no Instagram and no email, and shipping contactless rows to a paying
-# producer would inflate the result count while lowering what the product actually delivers.
-# Widen this set only once alt-source rows have a contact path of their own.
-ALT_SOURCE_PLANS = {'admin'}
+# Matches found through a non-Spotify database (Deezer, YouTube Music) go to everyone as of
+# 2026-08-14. They were admin-only while they had no contact path: an alt-source row carries
+# no Spotify artist page, so it had no listeners, no Instagram and no email, and shipping
+# contactless rows would have inflated the result count while lowering what the product
+# actually delivers.
+#
+# ISRC resolution closed that gap. A match's recording code now resolves to its exact Spotify
+# counterpart, and the row comes back with real listeners and a real contact — indistinguishable
+# from a native Spotify result. What does not resolve falls back to the platform's own artist
+# figures rather than being dropped. The gate has no reason to exist any more.
+ALT_SOURCE_PLANS = None  # None = every plan; a set would restrict to those plans
 
 
 def execute_scan(youtube_url, scan_id, plan=None):
@@ -172,7 +177,7 @@ def execute_scan(youtube_url, scan_id, plan=None):
         # ghost-artist rule is Spotify-only on purpose: has_discography is derived from the
         # Spotify artist page, so a Deezer/YouTube row has nothing to be judged on and would
         # be dropped for failing a test that was never run against it.
-        allow_alt = (plan or '') in ALT_SOURCE_PLANS
+        allow_alt = ALT_SOURCE_PLANS is None or (plan or '') in ALT_SOURCE_PLANS
 
         def qualifies(song):
             if song.get('spotify_url'):
