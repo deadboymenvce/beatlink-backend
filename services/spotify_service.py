@@ -589,20 +589,93 @@ class SpotifyService:
 
         return data
 
-    def _deezer_cover(self, deezer_id):
-        """Album cover for a Deezer track. Deezer's public API needs no key and no auth, so
-        this adds a real cover to an alt-source row at zero API cost. Strictly best-effort:
-        a scan must never fail because Deezer was slow, so any error returns an empty cover
-        and the row survives without one."""
+    def _deezer_track(self, deezer_id):
+        """Cover art, ISRC and artist id for a Deezer track, in one keyless call.
+
+        Deezer publishes the ISRC itself, which matters: it means a Deezer match can be
+        resolved to Spotify even when ACRCloud did not return an ISRC of its own. YouTube
+        matches have no such free fallback and depend entirely on ACRCloud's.
+
+        Strictly best-effort — a scan must never fail because Deezer was slow."""
         try:
             r = requests.get(f"https://api.deezer.com/track/{deezer_id}", timeout=4)
             if r.status_code != 200:
-                return ''
+                return {}
             data = r.json() or {}
             album = data.get('album') or {}
-            return album.get('cover_big') or album.get('cover_medium') or album.get('cover') or ''
+            artist = data.get('artist') or {}
+            return {
+                'cover_url': album.get('cover_big') or album.get('cover_medium') or album.get('cover') or '',
+                'isrc': str(data.get('isrc') or '').strip(),
+                'artist_id': str(artist.get('id') or ''),
+                'artist_name': artist.get('name') or '',
+            }
         except Exception:
-            return ''
+            return {}
+
+    def _deezer_artist(self, artist_id):
+        """Deezer's own artist figures, used only when ISRC resolution failed and there is no
+        Spotify artist page to read. nb_fan is Deezer's follower count, NOT Spotify monthly
+        listeners — a different metric, so it is never presented under the same label."""
+        try:
+            r = requests.get(f"https://api.deezer.com/artist/{artist_id}", timeout=4)
+            if r.status_code != 200:
+                return {}
+            d = r.json() or {}
+            return {
+                'nb_fan': int(d.get('nb_fan') or 0),
+                'nb_album': int(d.get('nb_album') or 0),
+                'picture': d.get('picture_big') or d.get('picture_medium') or d.get('picture') or '',
+            }
+        except Exception:
+            return {}
+
+    def _spotify_track_by_isrc(self, isrc):
+        """Resolve an exact recording on Spotify from its ISRC.
+
+        Returns the same shape as _get_track_details, so a resolved alt-source match rejoins
+        the normal enrichment path (artist scrape → listeners, city, Instagram) with no
+        special-casing downstream. Exactness is the whole point: an ISRC identifies one
+        recording, so unlike a title+artist search there is no homonym risk."""
+        if not isrc:
+            return {}
+        token = self._get_token()
+        if not token:
+            return {}
+        try:
+            r = requests.get(
+                "https://api.spotify.com/v1/search",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"q": f"isrc:{isrc}", "type": "track", "limit": 1},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return {}
+            items = ((r.json() or {}).get('tracks') or {}).get('items') or []
+            if not items:
+                return {}
+            t = items[0]
+            album = t.get('album') or {}
+            images = album.get('images') or []
+            cover_url = ''
+            for img in images:
+                if img.get('height') == 300:
+                    cover_url = img.get('url', '')
+                    break
+            if not cover_url and images:
+                cover_url = images[0].get('url', '')
+            artists = t.get('artists') or []
+            return {
+                'spotify_url': f"https://open.spotify.com/track/{t.get('id')}",
+                'cover_url': cover_url,
+                'release_date': album.get('release_date', ''),
+                'spotify_author_ID': artists[0]['id'] if artists else None,
+                'artist_name': artists[0]['name'] if artists else None,
+                'label': album.get('label', ''),
+            }
+        except Exception as e:
+            logger.warning(f"⚠️ ISRC lookup failed for {isrc}: {e}")
+            return {}
 
     def enrich_tracks(self, matches):
         """
@@ -643,10 +716,12 @@ class SpotifyService:
                 # listeners/city/Instagram come from — so those stay empty rather than faked,
                 # and the UI labels the row with its real source instead of implying Spotify.
                 source, source_url, cover_url = None, '', ''
+                dz = {}
                 if match.get('deezer_id'):
                     source = 'deezer'
                     source_url = f"https://www.deezer.com/track/{match['deezer_id']}"
-                    cover_url = self._deezer_cover(match['deezer_id'])
+                    dz = self._deezer_track(match['deezer_id'])
+                    cover_url = dz.get('cover_url', '')
                 elif match.get('youtube_vid'):
                     source = 'youtube'
                     source_url = f"https://www.youtube.com/watch?v={match['youtube_vid']}"
@@ -654,10 +729,45 @@ class SpotifyService:
                     # video id alone, so this costs nothing and cannot fail at scan time.
                     cover_url = f"https://img.youtube.com/vi/{match['youtube_vid']}/hqdefault.jpg"
 
-                if source:
-                    logger.info(f"🎯 '{match['title']}' by {match['artists']} kept via {source} (no Spotify link)")
-                else:
+                if not source:
                     logger.warning(f"⚠️ No platform link at all for '{match['title']}' by {match['artists']} — will be dropped")
+
+                # ── Tier 1: resolve the exact recording on Spotify via ISRC ──────────────
+                # ACRCloud's ISRC first, then Deezer's own (Deezer publishes it, so a Deezer
+                # match can still resolve even when ACRCloud returned none). A hit here means
+                # the row rejoins the ordinary enrichment path below and ends up with real
+                # listeners, city and Instagram — everything an alt-source row otherwise lacks.
+                isrc = (match.get('isrc') or '').strip() or dz.get('isrc', '')
+                resolved = self._spotify_track_by_isrc(isrc) if isrc else {}
+
+                if resolved.get('spotify_author_ID'):
+                    logger.info(f"🔗 '{match['title']}' by {match['artists']} resolved to Spotify via ISRC {isrc} (found on {source})")
+                    enriched.append({
+                        'title': match['title'],
+                        'artists': match['artists'],
+                        # Kept empty on purpose: `source` stays deezer/youtube so the card keeps
+                        # the branding of whatever actually identified the track, and app.py's
+                        # admin gate still applies. Only the ARTIST is borrowed from Spotify.
+                        'spotify_url': '',
+                        'spotify_author_ID': resolved['spotify_author_ID'],
+                        'cover_url': cover_url or resolved.get('cover_url', ''),
+                        'release_date': resolved.get('release_date'),
+                        'score': match['score'],
+                        'source': source,
+                        'source_url': source_url,
+                        'isrc': isrc,
+                    })
+                    artist_ids_to_fetch.append((resolved['spotify_author_ID'], resolved.get('artist_name')))
+                    continue
+
+                # ── Tier 2: no Spotify counterpart — fall back to the platform's own data ─
+                # Only Deezer has a usable public artist endpoint; a YouTube-only match has
+                # nothing equivalent and stays bare.
+                dz_artist = self._deezer_artist(dz['artist_id']) if dz.get('artist_id') else {}
+                if isrc and source:
+                    logger.info(f"↩️ '{match['title']}' has ISRC {isrc} but no Spotify counterpart — falling back to {source} data")
+                elif source:
+                    logger.info(f"🎯 '{match['title']}' by {match['artists']} kept via {source} (no ISRC available)")
 
                 enriched.append({
                     'title': match['title'],
@@ -667,7 +777,11 @@ class SpotifyService:
                     'cover_url': cover_url,
                     'release_date': None,
                     'score': match['score'],
-                    'listeners': 0,
+                    # nb_fan is Deezer followers, not Spotify monthly listeners. It rides in the
+                    # same field because it answers the same question ("how big is this artist"),
+                    # and the UI tells them apart by spotify_author_ID being null — the only
+                    # rows whose number did NOT come from a Spotify artist page.
+                    'listeners': dz_artist.get('nb_fan', 0),
                     'city': None,
                     'instagram_url': None,
                     'twitter_url': None,
@@ -675,9 +789,13 @@ class SpotifyService:
                     'email': None,
                     'low_signal': False,
                     'last_release_date': None,
-                    'artist_image': None,
+                    'artist_image': dz_artist.get('picture') or None,
+                    # Deezer's album count stands in for the Spotify discography check, so a
+                    # 0-release ghost is filtered on either platform rather than only one.
+                    'has_discography': dz_artist.get('nb_album', 1) > 0 if dz_artist else True,
                     'source': source,
                     'source_url': source_url,
+                    'isrc': isrc,
                 })
                 continue
 

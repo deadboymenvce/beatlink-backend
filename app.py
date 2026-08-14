@@ -177,7 +177,10 @@ def execute_scan(youtube_url, scan_id, plan=None):
         def qualifies(song):
             if song.get('spotify_url'):
                 return bool(song.get('cover_url')) and song.get('has_discography', True)
-            return allow_alt and bool(song.get('source'))
+            # Alt-source rows carry has_discography too now: from the Spotify artist page when
+            # the ISRC resolved, or from Deezer's own album count when it did not. A 0-release
+            # ghost is therefore filtered on either platform, not just on Spotify.
+            return allow_alt and bool(song.get('source')) and song.get('has_discography', True)
 
         filtered_songs = [song for song in enriched_songs if qualifies(song)]
 
@@ -204,7 +207,18 @@ def execute_scan(youtube_url, scan_id, plan=None):
         for song in filtered_songs:
             key = song.get('source') or ('spotify' if song.get('spotify_url') else 'unknown')
             by_source[key] = by_source.get(key, 0) + 1
-        scan_log.log('sources', f'Kept by source: {by_source}', data={'by_source': by_source, 'alt_enabled': allow_alt, 'plan': plan})
+
+        # ISRC coverage, measured rather than assumed. `alt_total` is every non-Spotify match
+        # ACRCloud produced, `alt_with_isrc` how many carried an ISRC at all (from ACRCloud or
+        # from Deezer), and `alt_resolved` how many of those actually found a counterpart on
+        # Spotify — the only ones that end up with listeners and a contact path.
+        alt_songs = [s for s in enriched_songs if s.get('source') in ('deezer', 'youtube')]
+        alt_with_isrc = sum(1 for s in alt_songs if s.get('isrc'))
+        alt_resolved = sum(1 for s in alt_songs if s.get('spotify_author_ID'))
+        scan_log.log('sources', f'Kept by source: {by_source} · ISRC {alt_resolved}/{alt_with_isrc} resolved of {len(alt_songs)} alt matches', data={
+            'by_source': by_source, 'alt_enabled': allow_alt, 'plan': plan,
+            'alt_total': len(alt_songs), 'alt_with_isrc': alt_with_isrc, 'alt_resolved': alt_resolved,
+        })
 
         logger.info(f"🔍 Filtered from {len(enriched_songs)} to {len(filtered_songs)} complete results")
         scan_log.log('filter', f'Kept {len(filtered_songs)} of {len(enriched_songs)} after the completeness/ghost-artist filter', data={

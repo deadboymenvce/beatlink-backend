@@ -182,6 +182,13 @@ class ACRCloudService:
                 # YouTube is the odd one out: a bare video id under 'vid', no nested track.
                 youtube_vid = str(external_metadata.get('youtube', {}).get('vid', '') or '')
 
+                # ISRC lives in external_IDS, a separate object from external_METADATA above —
+                # easy to look for in the wrong place. It is the exact identifier of this one
+                # recording, which is what lets a non-Spotify match be resolved to its Spotify
+                # counterpart with no ambiguity (a title+artist search cannot: it returns
+                # generic-title collisions, e.g. "Levels" matching an unrelated famous track).
+                isrc = str(music.get('external_ids', {}).get('isrc', '') or '').strip()
+
                 # DEBUG: which platforms did ACRCloud actually return for this match?
                 # Lets us confirm whether dropped (no-Spotify) tracks carry deezer/youtube IDs
                 # (cross-platform, just unlinked to Spotify) or no external links at all.
@@ -197,6 +204,7 @@ class ACRCloudService:
                     'spotify_id': f"spotify:track:{spotify_id}" if spotify_id else '',
                     'deezer_id': deezer_id,
                     'youtube_vid': youtube_vid,
+                    'isrc': isrc,
                     'score': score
                 }
                 
