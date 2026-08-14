@@ -352,15 +352,20 @@ class YouTubeService:
                     # Rebuilt every call (not once, up-front): if note_response rotates to
                     # the next account mid-poll, the very next call already uses it instead
                     # of waiting for the next video.
+                    cdn_label, cdn_key = self.cdn_key_rotator.current()
+                    if cdn_key is None:
+                        logger.error("❌ [cdn] No usable RapidAPI account left — aborting the CDN path")
+                        break
                     headers = {
-                        'x-rapidapi-key': self.cdn_key_rotator.current()[1],
+                        'x-rapidapi-key': cdn_key,
                         'x-rapidapi-host': self.rapidapi_host,
                     }
                     logger.info(f"🚀 [cdn] Requesting audio link (call {api_calls}): id={video_id}")
                     info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
                     # Only this call goes through the RapidAPI gateway — the CDN download
                     # below hits a plain file link, no RapidAPI headers to record there.
-                    self.cdn_key_rotator.note_response(info_resp.headers)
+                    # used_label makes the advance race-safe, same as the Spotify path.
+                    self.cdn_key_rotator.note_response(info_resp.headers, used_label=cdn_label)
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"⚠️ [cdn] API call {api_calls} failed: {e}")
                     time.sleep(5)

@@ -204,12 +204,19 @@ class SpotifyService:
                 # mid-retry (note_response fires after every response, including a
                 # 401/429), the very next retry of this same call already uses the new key
                 # instead of waiting for the next artist.
+                used_label, used_key = self.key_rotator.current()
+                if used_key is None:
+                    # Every account is already known to be out of quota or unsubscribed.
+                    # Retrying would be six guaranteed-identical failures per artist, which is
+                    # exactly what drained the pool: ~53 requests for 10 artists, 0 results.
+                    logger.error(f"❌ No usable RapidAPI account left for {artist_id} — skipping without retrying")
+                    break
                 headers = {
-                    'X-RapidAPI-Key': self.key_rotator.current()[1],
+                    'X-RapidAPI-Key': used_key,
                     'X-RapidAPI-Host': 'real-time-spotify-data-scraper.p.rapidapi.com'
                 }
                 response = requests.get(url, headers=headers, timeout=10)
-                self.key_rotator.note_response(response.headers)
+                switched = self.key_rotator.note_response(response.headers, used_label=used_label)
 
                 if response.status_code == 200:
                     data = response.json()
@@ -330,9 +337,20 @@ class SpotifyService:
                     }
                 
                 elif response.status_code == 429:
-                    # Rate limited - retry with backoff
+                    # Two very different things arrive as 429 and used to be treated the same:
+                    #   - "you are going too fast"     → waiting genuinely helps
+                    #   - "your monthly quota is gone" → waiting can never help, the answer is
+                    #     identical in one second and in one hour
+                    # note_response already switched keys if the quota was the reason, so a
+                    # switch means retry NOW on the fresh key rather than sleeping first.
+                    if switched:
+                        logger.warning(f"⚠️ 429 for {artist_id} on a spent key — retrying immediately on the next account")
+                        continue
+                    if self.key_rotator.all_spent():
+                        logger.error(f"❌ 429 for {artist_id} and every account is spent — not retrying")
+                        break
                     if attempt < max_retries - 1:
-                        wait_time = 1  # Wait 1 second
+                        wait_time = 1  # genuine rate limiting: a short wait is the right answer
                         logger.warning(f"⚠️ RapidAPI rate limit for {artist_id}, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         continue
@@ -345,6 +363,15 @@ class SpotifyService:
                     remaining = response.headers.get('X-RateLimit-Requests-Remaining', '?')
                     reset = response.headers.get('X-RateLimit-Requests-Reset', '?')
                     logger.warning(f"⚠️ RapidAPI 401 for {artist_id} — limit:{limit} remaining:{remaining} reset:{reset} (attempt {attempt + 1}/{max_retries})")
+                    # Same reasoning as the 429 branch: a 401 on a key whose quota just ran out
+                    # is not transient, and the 31s of exponential backoff below would be spent
+                    # waiting for something that cannot change.
+                    if switched:
+                        logger.warning(f"⚠️ 401 for {artist_id} on a spent key — retrying immediately on the next account")
+                        continue
+                    if self.key_rotator.all_spent():
+                        logger.error(f"❌ 401 for {artist_id} and every account is spent — not retrying")
+                        break
                     if attempt < max_retries - 1:
                         # Exponential backoff (1,2,4,8,16s) capped at 16s, plus up to 0.5s of
                         # jitter so the 4 parallel workers (ENRICH_MAX_WORKERS) don't all
@@ -358,10 +385,20 @@ class SpotifyService:
                         logger.error(f"❌ RapidAPI 401 exhausted for {artist_id} after {max_retries} attempts")
                         break
 
+                elif response.status_code == 403:
+                    # On RapidAPI a 403 means this account is not subscribed to THIS api. It
+                    # carries no quota headers, so note_response above could not act on it and
+                    # the key stayed active — every later call kept picking it and failing the
+                    # same way, blocking every account behind it in the waterfall.
+                    if self.key_rotator.mark_unusable(used_label, "returned 403 (account not subscribed to this API)"):
+                        continue
+                    logger.error(f"❌ 403 for {artist_id} and no account is left — check the RapidAPI subscriptions")
+                    break
+
                 else:
                     logger.error(f"❌ RapidAPI error {response.status_code} for {artist_id}")
                     break
-            
+
             except requests.Timeout:
                 logger.error(f"❌ RapidAPI timeout for {artist_id} (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
