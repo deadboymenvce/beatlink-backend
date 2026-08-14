@@ -1,7 +1,7 @@
 import os
 import logging
 import threading
-from services.api_usage_tracker import record_api_usage
+from services.api_usage_tracker import record_api_usage, fetch_spent_labels
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +61,28 @@ class KeyRotator:
         # which 777asthma/pluggzhawkins/ryuklol724 had zero recorded usage because they were
         # never actually used.
         self._lock = threading.Lock()
-        # Labels known to be unusable for the rest of this process's life: quota at zero, or
-        # a 403 meaning the account is not subscribed to this particular API. Kept so the
-        # rotator never hands back a key it already watched fail.
-        self._spent = set()
+        # Labels known to be unusable: quota at zero, or a 403 meaning the account is not
+        # subscribed to this particular API. Seeded from api_usage_status so a restart
+        # inherits what the previous process already paid to discover — otherwise the cursor
+        # returned to slot 1 on every redeploy and every scan re-opened by burning requests
+        # on a key that was already dead. Starting position is the first key NOT in this set.
+        self._spent = fetch_spent_labels(api_name)
+        if self._spent:
+            while self.idx < len(self.accounts) and self.accounts[self.idx][0] in self._spent:
+                self.idx += 1
+            skipped = [l for l, _ in self.accounts if l in self._spent]
+            logger.info(f"⏭️ KeyRotator for {api_name}: skipping {len(skipped)} already-spent account(s) at startup [{', '.join(skipped)}]")
         if not self.accounts:
             logger.error(f"❌ KeyRotator for {api_name}: no keys configured at all (checked {primary_env_var} + the shared pool)")
         elif len(self.accounts) == 1:
             logger.info(f"ℹ️ KeyRotator for {api_name}: only {self.accounts[0][0]} configured, no fallback available yet")
+        elif self.idx >= len(self.accounts):
+            logger.error(f"❌ KeyRotator for {api_name}: all {len(self.accounts)} configured account(s) are already out of quota — enrichment will be skipped, not retried")
         else:
             labels = ', '.join(label for label, _ in self.accounts)
-            logger.info(f"✅ KeyRotator for {api_name}: {len(self.accounts)} account(s) configured [{labels}], starting on {self.accounts[0][0]}")
+            # Reports the key it will ACTUALLY start on, which is no longer necessarily the
+            # first one now that spent accounts are skipped up front.
+            logger.info(f"✅ KeyRotator for {api_name}: {len(self.accounts)} account(s) configured [{labels}], starting on {self.accounts[self.idx][0]}")
 
     def current(self):
         """(label, key) for the account this call should use right now. (None, None) when

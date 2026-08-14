@@ -8,6 +8,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from services.bio_parser import extract_contacts, has_any_contact
 from services.key_rotation import KeyRotator
+from services.api_usage_tracker import fetch_artist_cache, store_artist_cache
 
 logger = logging.getLogger(__name__)
 
@@ -551,19 +552,23 @@ class SpotifyService:
                 'instagram_url': str or None
             }
         """
-        # Check cache
+        # In-process cache first: same artist twice inside one scan costs nothing at all.
         if artist_id in self.cache:
-            cached = self.cache[artist_id]
-            age = time.time() - cached['timestamp']
-            
-            # Cache valid for 24h (86400 seconds)
-            if age < 86400:
-                logger.info(f"✅ Cache hit for {artist_id} (age: {age/3600:.1f}h)")
-                return cached['data']
-            else:
-                logger.info(f"🔄 Cache expired for {artist_id} (age: {age/3600:.1f}h)")
-        
-        # Cache miss or expired - fetch from RapidAPI
+            logger.info(f"✅ Memory cache hit for {artist_id}")
+            return self.cache[artist_id]['data']
+
+        # Then the shared cache in Supabase. No expiry: monthly_listeners is already frozen at
+        # discovery time by the product (public.artist stores it once and never refreshes it),
+        # so re-buying it later changes nothing a user can see, and contacts don't change.
+        # This is what makes a repeat artist free across restarts AND across every producer,
+        # instead of costing a RapidAPI request out of 500/month each time.
+        cached = fetch_artist_cache(artist_id)
+        if cached:
+            logger.info(f"✅ DB cache hit for {artist_id} — 0 RapidAPI requests")
+            self.cache[artist_id] = {'data': cached, 'timestamp': time.time()}
+            return cached
+
+        # Cache miss - fetch from RapidAPI
         logger.info(f"🌐 Fetching {artist_id} from RapidAPI...")
         data = self._get_artist_data_rapidapi(artist_id)
 
@@ -623,6 +628,9 @@ class SpotifyService:
                 'data': data,
                 'timestamp': time.time()
             }
+            # Same condition guards the shared cache: a failed scrape (quota dead, 403) must
+            # never be persisted, or one bad afternoon would poison that artist permanently.
+            store_artist_cache(artist_id, data)
 
         return data
 

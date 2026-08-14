@@ -22,6 +22,83 @@ _SUPABASE_URL = os.getenv("SUPABASE_URL")
 _SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 
+def fetch_artist_cache(spotify_artist_id):
+    """Previously-scraped data for a Spotify artist, or None.
+
+    Deliberately has no expiry (see supabase/artist_scrape_cache.sql). Silent None on any
+    failure, so a cache outage costs a RapidAPI request rather than a broken scan.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY or not spotify_artist_id:
+        return None
+    try:
+        r = requests.get(
+            f"{_SUPABASE_URL}/rest/v1/artist_scrape_cache",
+            headers={"apikey": _SUPABASE_KEY, "Authorization": f"Bearer {_SUPABASE_KEY}"},
+            params={"select": "payload", "spotify_artist_id": f"eq.{spotify_artist_id}", "limit": 1},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return None
+        rows = r.json() or []
+        return rows[0].get("payload") if rows else None
+    except Exception:
+        return None
+
+
+def store_artist_cache(spotify_artist_id, payload):
+    """Persist one artist scrape. Fire-and-forget: never let caching break a scan."""
+    if not _SUPABASE_URL or not _SUPABASE_KEY or not spotify_artist_id:
+        return
+    try:
+        requests.post(
+            f"{_SUPABASE_URL}/rest/v1/artist_scrape_cache?on_conflict=spotify_artist_id",
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            json=[{
+                "spotify_artist_id": spotify_artist_id,
+                "payload": payload,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }],
+            timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ artist_scrape_cache upsert failed for {spotify_artist_id}: {e}")
+
+
+def fetch_spent_labels(api_name, floor=1):
+    """Key labels this API has already been told are out of quota, read back from the same
+    table record_api_usage writes to.
+
+    Exists so a fresh process doesn't have to rediscover, one wasted request at a time, what
+    the previous one already learned. Without it every container restart sent the rotator
+    back to the first key in the list, and if that key was spent, every scan opened by
+    burning requests on it before moving on.
+
+    Returns a set of labels. Empty on any failure, which degrades to exactly the old
+    behaviour rather than wrongly retiring a working key.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return set()
+    try:
+        r = requests.get(
+            f"{_SUPABASE_URL}/rest/v1/api_usage_status",
+            headers={"apikey": _SUPABASE_KEY, "Authorization": f"Bearer {_SUPABASE_KEY}"},
+            params={"select": "key_label,remaining", "api_name": f"eq.{api_name}",
+                    "remaining": f"lte.{floor}"},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return set()
+        return {row["key_label"] for row in (r.json() or []) if row.get("key_label")}
+    except Exception as e:
+        logger.warning(f"⚠️ could not read spent keys for {api_name}: {e}")
+        return set()
+
+
 def record_api_usage(api_name, headers, key_label=None):
     """
     api_name: stable identifier for the API, e.g. 'real-time-spotify-data-scraper'
