@@ -16,6 +16,24 @@ logger = logging.getLogger(__name__)
 # past the 45s the FFmpeg extract needs, with margin for the container's framing.
 PARTIAL_CAP_BYTES = 1_500_000
 
+# youtube-mp3-audio-video-downloader (nikzeferis), the "sync" provider: one request, M4A
+# straight back. OFF since 2026-08-16.
+#
+# Only one account (prodconnect@gmail.com) was ever subscribed to it, and that account is
+# out of monthly quota. The seven pool accounts are subscribed to youtube-mp3-2025 only, so
+# they answer 403 here — calling this provider means eight requests that cannot succeed
+# before the CDN path is even tried.
+#
+# Keeping the code rather than deleting it is deliberate: the quota resets at the start of
+# each billing cycle, and this is the faster and more reliable of the two providers when it
+# has headroom. Flip this back to True once the primary account's quota has reset, or once
+# the pool accounts are subscribed to this product too.
+#
+# Worth being precise about what this fixes: it does NOT fix a failing scan. The sync path
+# gives up in about five seconds, and it is the CDN provider that decides whether a scan
+# succeeds. This removes noise from the logs and the first few seconds of a cold scan.
+SYNC_PROVIDER_ENABLED = False
+
 
 def _iso8601_seconds(duration):
     """PT4M13S → 253. Returns 0 for anything unparseable, which drops the video rather
@@ -582,17 +600,19 @@ class YouTubeService:
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
 
-            # Fast path first; the slower CDN poller only runs if it actually fails.
+            # Fast path first, when it is worth calling at all; the slower CDN poller runs
+            # either way if it fails. See SYNC_PROVIDER_ENABLED for why it is currently off.
             winner = None
-            if self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+            if SYNC_PROVIDER_ENABLED and self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
                 winner = 'sync'
             else:
-                logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
+                if SYNC_PROVIDER_ENABLED:
+                    logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
                 if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
                     winner = 'cdn'
 
             if not winner:
-                logger.error("❌ Both audio providers failed")
+                logger.error("❌ Audio download failed on every enabled provider")
                 return None
 
             m4a_path = self._extract_30s(raw_path, video_id)
