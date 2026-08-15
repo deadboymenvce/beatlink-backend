@@ -49,10 +49,20 @@ class YouTubeService:
         # the sync API above fails or is unavailable.
         # Hardcoded so a stale RAPIDAPI_HOST env can't point at the old endpoint.
         self.rapidapi_host = "youtube-mp3-2025.p.rapidapi.com"
-        # This provider (only — the sync one above stays on the single RAPIDAPI_KEY)
-        # waterfalls through the shared backup-account pool once RAPIDAPI_KEY's own quota
-        # is nearly spent. See services/key_rotation.py.
+        # Both providers waterfall through the shared backup-account pool once the primary
+        # RAPIDAPI_KEY's own quota is nearly spent. See services/key_rotation.py.
+        #
+        # The sync one used to stay on the single RAPIDAPI_KEY, which is what took the whole
+        # scan pipeline down on 2026-08-15: youtube-mp3-2025 broke on its own side (500s and
+        # 504s, "failed to get video info", Errno 111 — nothing to do with quota), the scan
+        # fell through to the sync provider as designed, and that one answered 429 MONTHLY
+        # QUOTA EXCEEDED with no second account to try. Seven were sitting right there.
+        #
+        # Two rotators, not one shared instance: they are different RapidAPI products, so an
+        # account can be out of quota (or unsubscribed) on one and perfectly fine on the
+        # other. Each tracks its own cursor, which is exactly what KeyRotator is built for.
         self.cdn_key_rotator = KeyRotator('youtube-mp3-2025', 'prodconnect@gmail.com', 'RAPIDAPI_KEY')
+        self.sync_key_rotator = KeyRotator('youtube-mp3-audio-video-downloader', 'prodconnect@gmail.com', 'RAPIDAPI_KEY')
 
         if self.api_key:
             logger.info("✅ YOUTUBE_API_KEY configured")
@@ -267,31 +277,62 @@ class YouTubeService:
         """
         youtube-mp3-audio-video-downloader — one request, returns the M4A binary directly
         (no polling). Fast (~30s observed) and simple: it either works or it doesn't, so
-        failures here are cheap and we move on quickly. Normally the primary provider, but
-        called second for now (see download_audio) while its RapidAPI quota is tight.
+        failures here are cheap and we move on quickly. The primary provider, tried first
+        (see download_audio).
         When max_bytes is set, stops reading once that many bytes are on disk (partial
         download — see PARTIAL_CAP_BYTES). Returns True if raw_path was written.
         """
-        headers = {
-            'Content-Type': 'application/json',
-            'x-rapidapi-host': self.rapidapi_sync_host,
-            'x-rapidapi-key': self.rapidapi_key,
-        }
         url = f"https://{self.rapidapi_sync_host}/download-m4a/{video_id}"
 
-        # Single attempt with a generous read timeout: this provider transcodes the file
-        # server-side BEFORE it streams a single byte, so the first byte can take ~40-50s.
-        # The old 30s read-timeout cut that off mid-transcode and forced a wasteful retry
-        # (which is exactly what made scans feel slow). 90s covers virtually any transcode;
-        # once bytes start flowing the partial cap stops us in ~1s. On any failure we fall
-        # through to the CDN provider rather than retrying the slow transcode here.
-        try:
-            logger.info(f"🚀 [sync] Requesting M4A: id={video_id}")
-            r = requests.get(url, headers=headers, timeout=(10, 90), stream=True)
-            record_api_usage('youtube-mp3-audio-video-downloader', r.headers)
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"⚠️ [sync] Request failed: {e}")
-            return False
+        # One attempt PER ACCOUNT, waterfalling on the two answers that mean "this key is
+        # done here" and nothing else: 429 (monthly quota spent) and 403 (this account isn't
+        # subscribed to this product). Every other failure still falls straight through to
+        # the CDN provider, since retrying a slow transcode on another key would cost ~90s
+        # to learn nothing. The loop terminates on its own: the rotator only ever moves
+        # forward and hands back (None, None) once every account is written off.
+        #
+        # Generous read timeout because this provider transcodes server-side BEFORE it
+        # streams a single byte, so the first byte can take ~40-50s. The old 30s read-timeout
+        # cut that off mid-transcode and forced a wasteful retry, which is exactly what made
+        # scans feel slow. 90s covers virtually any transcode; once bytes start flowing the
+        # partial cap stops us in ~1s.
+        while True:
+            sync_label, sync_key = self.sync_key_rotator.current()
+            if sync_key is None:
+                logger.error("❌ [sync] No usable RapidAPI account left for this provider")
+                return False
+
+            headers = {
+                'Content-Type': 'application/json',
+                'x-rapidapi-host': self.rapidapi_sync_host,
+                'x-rapidapi-key': sync_key,
+            }
+
+            try:
+                logger.info(f"🚀 [sync] Requesting M4A: id={video_id} (account: {sync_label})")
+                r = requests.get(url, headers=headers, timeout=(10, 90), stream=True)
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"⚠️ [sync] Request failed: {e}")
+                return False
+
+            # Records usage against the key that actually made the call, and advances on its
+            # own when RapidAPI's remaining-requests header says this was the last one.
+            switched = self.sync_key_rotator.note_response(r.headers, used_label=sync_label)
+
+            if r.status_code in (403, 429):
+                body = r.text[:200]
+                r.close()
+                logger.warning(f"⚠️ [sync] {r.status_code} on '{sync_label}': {body}")
+                if not switched:
+                    reason = ('is not subscribed to this API' if r.status_code == 403
+                              else 'is out of monthly quota')
+                    switched = self.sync_key_rotator.mark_unusable(sync_label, reason)
+                if switched:
+                    continue
+                logger.error("❌ [sync] Every configured account is spent on this provider")
+                return False
+
+            break
 
         if r.status_code != 200:
             logger.warning(f"⚠️ [sync] Non-200: {r.status_code} - {r.text[:200]}")
@@ -318,8 +359,8 @@ class YouTubeService:
         """
         youtube-mp3-2025 — async, on-demand transcode. Hands back a CDN link that 504s
         ("not ready") until conversion finishes, so this polls: re-requesting a fresh link
-        a few times and retrying the CDN with backoff. Normally the fallback provider, but
-        called first for now (see download_audio) to spare the sync provider's tight quota.
+        a few times and retrying the CDN with backoff. The fallback provider, only reached
+        when the sync one above fails (see download_audio).
         When max_bytes is set, stops reading once that many bytes are on disk (partial
         download). Returns True if raw_path was written, False otherwise (never raises).
         """
@@ -473,13 +514,18 @@ class YouTubeService:
 
     def download_audio(self, youtube_url):
         """
-        Get a 30s M4A slice for ACRCloud. Sequential, CDN-provider first: as of 2026-08-09
-        the sync provider's RapidAPI quota was down to ~12/100 requests for the cycle, so
-        priority is flipped to spare it — the slower CDN-polling provider now goes first,
-        and the fast sync one is only touched as a fallback if the CDN one fails. Flip this
-        back to sync-first once the sync provider's quota has real headroom again (it's the
-        faster, more reliable path when both are healthy). Only a partial slice of the file
-        is pulled, not the whole track.
+        Get a 30s M4A slice for ACRCloud. Sequential, sync-provider first.
+
+        Order flipped back on 2026-08-16, which is what the CDN-first note here always said
+        to do "once the sync provider's quota has real headroom again". It does now: the sync
+        path stopped being a single key and waterfalls through the whole account pool, same
+        as the CDN one (see _fetch_raw_via_sync_api). The reason to spare it is gone.
+
+        The incident that forced it is the other half: youtube-mp3-2025 broke on its own
+        side, and CDN-first meant every scan burned ~150s polling a provider that could not
+        answer before the working path was even tried. Sync is also the faster and more
+        reliable of the two when both are healthy, so this is the right resting state, not a
+        temporary workaround. Only a partial slice of the file is pulled, not the whole track.
 
         If the partial file can't be decoded (its M4A moov atom sat past the cut), we
         re-download the FULL file from whichever provider won and extract from that — so
@@ -505,15 +551,14 @@ class YouTubeService:
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
 
-            # Privilege the CDN provider while the sync provider's quota is tight; only
-            # fall back to sync if the CDN one actually fails.
+            # Fast path first; the slower CDN poller only runs if it actually fails.
             winner = None
-            if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
-                winner = 'cdn'
+            if self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                winner = 'sync'
             else:
-                logger.warning("⚠️ CDN provider failed — falling back to sync provider...")
-                if self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
-                    winner = 'sync'
+                logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
+                if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                    winner = 'cdn'
 
             if not winner:
                 logger.error("❌ Both audio providers failed")
