@@ -155,6 +155,20 @@ class KeyRotator:
                 return False
             return self._advance_locked(reason, active_label)
 
+    def usable_accounts(self, limit=None):
+        """Every account still worth trying, starting at the cursor, WITHOUT mutating
+        anything. For callers that want to try several keys inside a single operation
+        rather than one per call.
+
+        The distinction from current()/note_response matters: those exist for "this key is
+        finished, move on permanently". This is for "this key answered but the work still
+        failed, let me try a sibling" — a failed download says nothing about the key's quota,
+        so writing it off would retire a perfectly good account over one bad video.
+        """
+        with self._lock:
+            out = [(label, key) for label, key in self.accounts[self.idx:] if label not in self._spent]
+        return out[:limit] if limit else out
+
     def all_spent(self):
         """True once no usable account remains — callers should stop retrying entirely
         rather than burn attempts against keys already known to be dead."""

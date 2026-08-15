@@ -386,6 +386,18 @@ class YouTubeService:
         # off and none of them was ever given time to finish.
         link_attempts = 0
         last_cdn_body = ''
+        # Spread the attempts across several accounts instead of hammering one. Observed on
+        # 2026-08-15: the primary key kept handing back links that 500'd, while the exact
+        # same request on a pool key returned audio from RapidAPI's console. A link failing
+        # is not a quota signal, so the rotator's own cursor must NOT be advanced for it
+        # (that would retire a healthy account over one bad video) — hence usable_accounts,
+        # which reads the pool without mutating it. Same total budget as before, just not
+        # all of it spent on one key.
+        cdn_accounts = self.cdn_key_rotator.usable_accounts()
+        if not cdn_accounts:
+            logger.error("❌ [cdn] No usable RapidAPI account left — aborting the CDN path")
+            return False
+        CALLS_PER_ACCOUNT = 2
         # Budget kept well under Gunicorn's --timeout (currently 240s), with headroom left
         # for the sync attempt that already ran, plus ACRCloud/Spotify/response afterward.
         # Previously this matched the worker timeout exactly and lost that race, getting
@@ -402,13 +414,10 @@ class YouTubeService:
             if download_url is None and api_calls < 6:
                 api_calls += 1
                 try:
-                    # Rebuilt every call (not once, up-front): if note_response rotates to
-                    # the next account mid-poll, the very next call already uses it instead
-                    # of waiting for the next video.
-                    cdn_label, cdn_key = self.cdn_key_rotator.current()
-                    if cdn_key is None:
-                        logger.error("❌ [cdn] No usable RapidAPI account left — aborting the CDN path")
-                        break
+                    # Every CALLS_PER_ACCOUNT link requests, move to the next account in the
+                    # pool. Clamped to the last one so a long poll keeps working rather than
+                    # falling off the end of the list.
+                    cdn_label, cdn_key = cdn_accounts[min((api_calls - 1) // CALLS_PER_ACCOUNT, len(cdn_accounts) - 1)]
                     headers = {
                         'x-rapidapi-key': cdn_key,
                         'x-rapidapi-host': self.rapidapi_host,
