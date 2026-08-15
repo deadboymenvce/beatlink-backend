@@ -373,6 +373,59 @@ class YouTubeService:
         logger.info(f"✅ [sync] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
         return True
 
+    def _await_cdn_conversion(self, progress_url, deadline):
+        """Block until this provider has finished transcoding, then let the caller download.
+
+        `linkDownloadProgress` is not a percentage, it is a Server-Sent Events URL
+        (…/sse-progress?video_id=…&token=…). Discovered from the payload logged during the
+        2026-08-15 outage, and it explains the whole failure: every request went straight to
+        /download the instant the link was handed over, i.e. asking for a file the provider
+        had not started writing. That returns 504 "not ready" while it works, and 500 with
+        its own yt-dlp error when the fetch it kicks off fails. The same link opened by hand
+        a few seconds later, once conversion had finished, served audio fine — which is
+        exactly what the RapidAPI console does and why it always looked like our keys.
+
+        The stream closing is the completion signal, so this does not depend on guessing the
+        event schema. Explicit success and failure markers are honoured when they show up,
+        and the first few events are logged so the schema stops being a guess at all.
+        """
+        budget = min(90, deadline - time.time())
+        if budget <= 0:
+            return False
+
+        seen = 0
+        last = ''
+        try:
+            with requests.get(progress_url, stream=True, timeout=(10, budget)) as sse:
+                if sse.status_code != 200:
+                    logger.warning(f"⚠️ [cdn] progress stream returned {sse.status_code}")
+                    return False
+                for line in sse.iter_lines(decode_unicode=True):
+                    if time.time() > deadline:
+                        logger.warning("⚠️ [cdn] progress stream still running at the deadline")
+                        return False
+                    if not line:
+                        continue
+                    last = line[:200]
+                    if seen < 3:
+                        seen += 1
+                        logger.info(f"📶 [cdn] progress event: {last}")
+                    low = line.lower()
+                    # Strict markers only. A plain `error` substring would match the
+                    # `"error": false` this provider sends on every healthy payload.
+                    if '"error":true' in low.replace(' ', '') or '"status":"error"' in low.replace(' ', '') or 'failed' in low:
+                        logger.warning(f"⚠️ [cdn] conversion reported a failure: {last}")
+                        return False
+                    if any(m in low for m in ('"done"', '"completed"', '"complete"', '"finished"', '"success"')):
+                        logger.info(f"✅ [cdn] conversion finished: {last}")
+                        return True
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"⚠️ [cdn] progress stream failed: {e} (last event: {last or 'n/a'})")
+            return False
+
+        logger.info(f"✅ [cdn] progress stream closed — conversion done (last event: {last or 'n/a'})")
+        return True
+
     def _fetch_raw_via_cdn_api(self, video_id, raw_path, max_bytes=None):
         """
         youtube-mp3-2025 — async, on-demand transcode. Hands back a CDN link that 504s
@@ -421,9 +474,11 @@ class YouTubeService:
         # Previously this matched the worker timeout exactly and lost that race, getting
         # SIGKILLed mid-request instead of reaching app.py's graceful 500.
         download_start = time.time()
-        # Fallback budget: the sync provider may already have spent up to ~90s before we
-        # get here, so cap the CDN at 120s to stay under Gunicorn's --timeout with room
-        # for the moov re-download + ACRCloud + Spotify + response.
+        # 120s under Gunicorn's --timeout (240s), leaving room for the moov re-download +
+        # ACRCloud + Spotify + response. Kept at 120 even though the sync provider no longer
+        # spends anything ahead of us: waiting on the progress stream makes a successful scan
+        # FASTER, not slower (a finished transcode downloads first try instead of being
+        # retried blind), so the budget did not need raising.
         deadline = download_start + 120
 
         while time.time() < deadline and file_resp is None:
@@ -472,6 +527,17 @@ class YouTubeService:
                     time.sleep(7)
                     continue
                 link_attempts = 0
+
+                # Wait for the transcode to finish before touching /download. Skipping this
+                # is what made every attempt fail — see _await_cdn_conversion. A failed or
+                # absent stream is not fatal: fall through and try the link anyway, since the
+                # file may already be cached from an earlier request for the same video.
+                progress_url = data.get('linkDownloadProgress')
+                if progress_url:
+                    if not self._await_cdn_conversion(progress_url, deadline):
+                        logger.warning("⚠️ [cdn] conversion did not complete — trying the link anyway")
+                else:
+                    logger.info("ℹ️ [cdn] no progress stream in the payload — downloading directly")
 
             # Try the CDN link.
             link_attempts += 1
