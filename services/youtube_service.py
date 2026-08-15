@@ -365,14 +365,26 @@ class YouTubeService:
         download). Returns True if raw_path was written, False otherwise (never raises).
         """
         info_url = f"https://{self.rapidapi_host}/v1/social/youtube/audio"
-        # 64kbps instead of 128 — ACRCloud fingerprints, it doesn't listen, so half the
-        # bitrate = ~half the bytes to transcode/transfer. If this provider ever rejects
-        # 64kbps the CDN call just fails and the parallel sync provider carries the scan.
-        params = {'id': video_id, 'quality': '64kbps', 'ext': 'm4a'}
+        # No `quality` override. It used to ask for 64kbps instead of 128 on the reasoning
+        # that ACRCloud fingerprints rather than listens, so half the bitrate is half the
+        # bytes — with the comment itself conceding "if this provider ever rejects 64kbps the
+        # CDN call just fails". On 2026-08-15 that is exactly what it looked like: the API
+        # answered 200 with a link every time, and the link itself then 500'd with the
+        # provider's own yt-dlp error, while the same endpoint called from RapidAPI's console
+        # on a pool key returned audio fine. The difference between the two calls was this
+        # parameter, so it goes. A non-default bitrate forces an on-demand transcode instead
+        # of serving whatever is already prepared, which is the fragile path on this provider.
+        params = {'id': video_id, 'ext': 'm4a'}
 
         file_resp = None
         download_url = None
         api_calls = 0
+        # How many times the CURRENT link has been tried. The link is only thrown away and
+        # re-requested after a couple of failures, not after every one: this provider
+        # transcodes on demand, so a fresh link restarts the conversion from zero. The old
+        # loop discarded the link on every failure, which meant six conversions were kicked
+        # off and none of them was ever given time to finish.
+        link_attempts = 0
         last_cdn_body = ''
         # Budget kept well under Gunicorn's --timeout (currently 240s), with headroom left
         # for the sync attempt that already ran, plus ACRCloud/Spotify/response afterward.
@@ -401,7 +413,7 @@ class YouTubeService:
                         'x-rapidapi-key': cdn_key,
                         'x-rapidapi-host': self.rapidapi_host,
                     }
-                    logger.info(f"🚀 [cdn] Requesting audio link (call {api_calls}): id={video_id}")
+                    logger.info(f"🚀 [cdn] Requesting audio link (call {api_calls}): id={video_id} (account: {cdn_label})")
                     info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 120))
                     # Only this call goes through the RapidAPI gateway — the CDN download
                     # below hits a plain file link, no RapidAPI headers to record there.
@@ -419,14 +431,23 @@ class YouTubeService:
                 if data.get('error'):
                     logger.error(f"❌ [cdn] API returned error: {data}")
                     return False
-                logger.info(f"🔎 [cdn] API payload (call {api_calls}): status={data.get('status')} keys={list(data.keys())}")
+                # Log the VALUES that decide what happens next, not the key names. Logging
+                # `keys=[...]` meant three separate incidents were debugged without ever
+                # seeing the conversion progress or the link that was about to be fetched.
+                logger.info(
+                    f"🔎 [cdn] API payload (call {api_calls}): status={data.get('status')} "
+                    f"progress={data.get('linkDownloadProgress')} error={data.get('error')!r} "
+                    f"link={(data.get('linkDownload') or data.get('linkStream') or 'none')[:120]}"
+                )
                 download_url = data.get('linkDownload') or data.get('linkStream')
                 if not download_url:
                     logger.info("⏳ [cdn] Link not ready yet — converting, will re-request…")
                     time.sleep(7)
                     continue
+                link_attempts = 0
 
             # Try the CDN link.
+            link_attempts += 1
             try:
                 r = requests.get(download_url, timeout=(10, 120), stream=True)
                 ctype = r.headers.get('content-type', '')
@@ -442,9 +463,10 @@ class YouTubeService:
             except requests.exceptions.RequestException as e:
                 logger.warning(f"⚠️ [cdn] CDN download failed: {e}")
 
-            # Still converting → drop this link to grab a fresh one (until the API cap),
-            # then back off before the next attempt.
-            if api_calls < 6:
+            # Give the same link a second chance before asking for a new one: a 504 here
+            # means "still converting", and re-requesting immediately would throw away the
+            # conversion that is already running and start another.
+            if link_attempts >= 2 and api_calls < 6:
                 download_url = None
             time.sleep(6)
 
