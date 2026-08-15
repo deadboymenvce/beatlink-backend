@@ -4,6 +4,7 @@ import logging
 import tempfile
 import subprocess
 import re
+import json
 import requests
 
 from services.api_usage_tracker import record_api_usage
@@ -374,57 +375,71 @@ class YouTubeService:
         return True
 
     def _await_cdn_conversion(self, progress_url, deadline):
-        """Block until this provider has finished transcoding, then let the caller download.
+        """Watch this provider's transcode until it finishes, reconnecting as needed.
 
-        `linkDownloadProgress` is not a percentage, it is a Server-Sent Events URL
-        (…/sse-progress?video_id=…&token=…). Discovered from the payload logged during the
-        2026-08-15 outage, and it explains the whole failure: every request went straight to
-        /download the instant the link was handed over, i.e. asking for a file the provider
-        had not started writing. That returns 504 "not ready" while it works, and 500 with
-        its own yt-dlp error when the fetch it kicks off fails. The same link opened by hand
-        a few seconds later, once conversion had finished, served audio fine — which is
-        exactly what the RapidAPI console does and why it always looked like our keys.
+        `linkDownloadProgress` is a Server-Sent Events URL, not a percentage. Its events look
+        like:
 
-        The stream closing is the completion signal, so this does not depend on guessing the
-        event schema. Explicit success and failure markers are honoured when they show up,
-        and the first few events are logged so the schema stops being a guess at all.
+            event:progress
+            data:{"elapsed_time":0.09,"ext":"m4a","progress":25,"quality":"default",
+                  "status":"in_progress","video_id":"vjWwR5FGj1k"}
+
+        Three things learned the hard way on 2026-08-15, all of them load-bearing:
+
+        1. The stream gets cut mid-transcode ("Response ended prematurely" at 25%). That is
+           routine for a long-lived SSE and says nothing about the job, so a drop means
+           reconnect to the SAME url, not give up.
+        2. Giving up meant asking the API for a new link, and a new link is a new CDN node
+           (cdn-ytb -> cdn-ytb-247 / cdn-ytb-mega in the same scan) which restarts the
+           transcode from 0%. Every retry threw away the progress it was waiting on.
+        3. The read timeout has to be per-connection. It was being derived from the time left
+           in the whole budget, so late attempts got a 13s timeout and were killed while the
+           transcode was healthy and advancing.
         """
-        budget = min(90, deadline - time.time())
-        if budget <= 0:
-            return False
-
-        seen = 0
-        last = ''
-        try:
-            with requests.get(progress_url, stream=True, timeout=(10, budget)) as sse:
-                if sse.status_code != 200:
-                    logger.warning(f"⚠️ [cdn] progress stream returned {sse.status_code}")
-                    return False
-                for line in sse.iter_lines(decode_unicode=True):
-                    if time.time() > deadline:
-                        logger.warning("⚠️ [cdn] progress stream still running at the deadline")
+        last_progress = -1
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                with requests.get(progress_url, stream=True, timeout=(10, min(45, remaining))) as sse:
+                    if sse.status_code != 200:
+                        logger.warning(f"⚠️ [cdn] progress stream returned {sse.status_code}")
                         return False
-                    if not line:
-                        continue
-                    last = line[:200]
-                    if seen < 3:
-                        seen += 1
-                        logger.info(f"📶 [cdn] progress event: {last}")
-                    low = line.lower()
-                    # Strict markers only. A plain `error` substring would match the
-                    # `"error": false` this provider sends on every healthy payload.
-                    if '"error":true' in low.replace(' ', '') or '"status":"error"' in low.replace(' ', '') or 'failed' in low:
-                        logger.warning(f"⚠️ [cdn] conversion reported a failure: {last}")
-                        return False
-                    if any(m in low for m in ('"done"', '"completed"', '"complete"', '"finished"', '"success"')):
-                        logger.info(f"✅ [cdn] conversion finished: {last}")
-                        return True
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"⚠️ [cdn] progress stream failed: {e} (last event: {last or 'n/a'})")
-            return False
+                    for line in sse.iter_lines(decode_unicode=True):
+                        if time.time() > deadline:
+                            logger.warning(f"⚠️ [cdn] transcode still at {last_progress}% at the deadline")
+                            return False
+                        if not line or not line.startswith('data:'):
+                            continue
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except ValueError:
+                            continue
+                        status = str(ev.get('status', '')).lower()
+                        progress = ev.get('progress')
+                        if isinstance(progress, (int, float)) and progress != last_progress:
+                            last_progress = progress
+                            logger.info(f"📶 [cdn] transcode {progress}% ({status or 'n/a'})")
+                        if status in ('error', 'failed', 'failure'):
+                            logger.warning(f"⚠️ [cdn] transcode reported {status}")
+                            return False
+                        if status in ('done', 'completed', 'complete', 'finished', 'success')                                 or (isinstance(progress, (int, float)) and progress >= 100):
+                            logger.info("✅ [cdn] transcode complete")
+                            return True
+            except requests.exceptions.RequestException as e:
+                # A dropped stream is not a failed transcode — reconnect and keep watching.
+                logger.info(f"↻ [cdn] progress stream dropped at {last_progress}% "
+                            f"({e.__class__.__name__}) — reconnecting")
+                time.sleep(2)
+                continue
+            # Closed cleanly with no terminal event: this provider ends the stream when the
+            # job is done, so that IS the completion signal.
+            logger.info(f"✅ [cdn] progress stream closed at {last_progress}% — treating as complete")
+            return True
 
-        logger.info(f"✅ [cdn] progress stream closed — conversion done (last event: {last or 'n/a'})")
-        return True
+        logger.warning(f"⚠️ [cdn] transcode still at {last_progress}% at the deadline")
+        return False
 
     def _fetch_raw_via_cdn_api(self, video_id, raw_path, max_bytes=None):
         """
@@ -474,12 +489,16 @@ class YouTubeService:
         # Previously this matched the worker timeout exactly and lost that race, getting
         # SIGKILLed mid-request instead of reaching app.py's graceful 500.
         download_start = time.time()
-        # 120s under Gunicorn's --timeout (240s), leaving room for the moov re-download +
-        # ACRCloud + Spotify + response. Kept at 120 even though the sync provider no longer
-        # spends anything ahead of us: waiting on the progress stream makes a successful scan
-        # FASTER, not slower (a finished transcode downloads first try instead of being
-        # retried blind), so the budget did not need raising.
-        deadline = download_start + 120
+        # 170s. The old 120s was sized against Gunicorn's --timeout, which does not apply
+        # here: POST /scan returns 202 immediately and the work runs in its own thread (see
+        # app.py's _run_job), so nothing HTTP is waiting on this. What actually bounds it is
+        # app.py's MAX_JOB_SECONDS (240s), which is what actually stops a job — so this
+        # leaves ~70s after the download for ACRCloud + Spotify + the response.
+        #
+        # It matters because the transcode is genuinely slow: the 2026-08-15 logs show it at
+        # 25% after 30s, so a 120s budget was abandoning jobs that were progressing normally
+        # and would have finished.
+        deadline = download_start + 170
 
         while time.time() < deadline and file_resp is None:
             # (Re)fetch a link when we don't have one. Capped to spare RapidAPI quota:
@@ -556,10 +575,11 @@ class YouTubeService:
             except requests.exceptions.RequestException as e:
                 logger.warning(f"⚠️ [cdn] CDN download failed: {e}")
 
-            # Give the same link a second chance before asking for a new one: a 504 here
-            # means "still converting", and re-requesting immediately would throw away the
-            # conversion that is already running and start another.
-            if link_attempts >= 2 and api_calls < 6:
+            # Keep hammering the SAME link. A 504 here means "still converting", and a new
+            # link comes from a different CDN node with its own transcode starting at 0%, so
+            # asking for one throws away the work we just waited on. Only after several
+            # failures is the link considered genuinely dead.
+            if link_attempts >= 4 and api_calls < 6:
                 download_url = None
             time.sleep(6)
 
