@@ -4,7 +4,6 @@ import logging
 import tempfile
 import subprocess
 import re
-import json
 import requests
 
 from services.api_usage_tracker import record_api_usage
@@ -16,25 +15,6 @@ logger = logging.getLogger(__name__)
 # pull the whole 3-4 min file. ~1.5 MB covers ~90s @128kbps / ~180s @64kbps — always well
 # past the 45s the FFmpeg extract needs, with margin for the container's framing.
 PARTIAL_CAP_BYTES = 1_500_000
-
-# youtube-mp3-audio-video-downloader (nikzeferis), the "sync" provider: one request, M4A
-# straight back. OFF since 2026-08-16.
-#
-# Only one account (prodconnect@gmail.com) was ever subscribed to it, and that account is
-# out of monthly quota. The seven pool accounts are subscribed to youtube-mp3-2025 only, so
-# they answer 403 here — calling this provider means eight requests that cannot succeed
-# before the CDN path is even tried.
-#
-# Keeping the code rather than deleting it is deliberate: the quota resets at the start of
-# each billing cycle, and this is the faster and more reliable of the two providers when it
-# has headroom. Flip this back to True once the primary account's quota has reset, or once
-# the pool accounts are subscribed to this product too.
-#
-# Worth being precise about what this fixes: it does NOT fix a failing scan. The sync path
-# gives up in about five seconds, and it is the CDN provider that decides whether a scan
-# succeeds. This removes noise from the logs and the first few seconds of a cold scan.
-SYNC_PROVIDER_ENABLED = False
-
 
 def _iso8601_seconds(duration):
     """PT4M13S → 253. Returns 0 for anything unparseable, which drops the video rather
@@ -63,17 +43,16 @@ class YouTubeService:
         # 2026-07-17 — kept as the fast path anyway since a dead/removed endpoint just fails
         # fast and falls through to the CDN path below, never a regression either way.
         self.rapidapi_sync_host = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
-        # Youtube Convert MP3/M4A — the audio provider. Same underlying service as the old
-        # youtube-mp3-2025 (same zm.io.vn CDN, same payload shape), reached through a
-        # different RapidAPI listing, on a plan of 300 requests/month. That budget is why
-        # _fetch_raw_via_cdn_api makes exactly one request per beat.
-        # Hardcoded so a stale RAPIDAPI_HOST env can't point at the old endpoint.
-        self.rapidapi_host = "youtube-convert-mp3-m4a.p.rapidapi.com"
-        # Deliberately a single key (RAPIDAPI_KEY) rather than the account pool, 2026-08-16.
-        # Only prodconnect512@gmail.com is subscribed to this listing so far, and the point
-        # right now is to get one account working end to end. KeyRotator stays in the repo
-        # and the pool can be rebound here once the other accounts are subscribed — see
-        # services/key_rotation.py and the sync rotator below, still wired for that.
+        # zm.io.vn (sold on RapidAPI as youtube-mp3-2025, then as youtube-convert-mp3-m4a)
+        # is gone. Both listings were the same service: they returned a link to a file they
+        # had not built yet, and their progress stream ended in "Download failed or timeout"
+        # because they could not read the video from YouTube. Removed 2026-08-16 after a full
+        # evening of failed scans. There is one provider now, the one above.
+        # Waterfalls through the account pool: RAPIDAPI_KEY (slot 1, prodconnect512) is out of
+        # monthly quota and answers 429, so the rotator moves to RAPIDAPI_KEY_POOL_2
+        # (777asthma), which is subscribed and working as of 2026-08-16. Slots 3-8 are not
+        # subscribed yet and will answer 403 until they are; the rotator writes each one off
+        # on that answer and carries on, so adding them later needs no code change.
         self.sync_key_rotator = KeyRotator('youtube-mp3-audio-video-downloader', 'prodconnect@gmail.com', 'RAPIDAPI_KEY')
 
         if self.api_key:
@@ -87,7 +66,7 @@ class YouTubeService:
             logger.error("❌ RAPIDAPI_KEY not set")
         
         logger.info(f"📁 Temp directory: {self.temp_dir}")
-        logger.info(f"🎬 Using RapidAPI: {self.rapidapi_host}")
+        logger.info(f"🎬 Using RapidAPI: {self.rapidapi_sync_host}")
 
     def _extract_video_id(self, url):
         """Extract video ID from various YouTube URL formats"""
@@ -286,277 +265,112 @@ class YouTubeService:
             }
 
     def _fetch_raw_via_sync_api(self, video_id, raw_path, max_bytes=None):
-        """
-        youtube-mp3-audio-video-downloader — one request, returns the M4A binary directly
-        (no polling). Fast (~30s observed) and simple: it either works or it doesn't, so
-        failures here are cheap and we move on quickly. The primary provider, tried first
-        (see download_audio).
-        When max_bytes is set, stops reading once that many bytes are on disk (partial
-        download — see PARTIAL_CAP_BYTES). Returns True if raw_path was written.
-        """
-        url = f"https://{self.rapidapi_sync_host}/download-m4a/{video_id}"
+        """YouTube MP3 Audio Video Downloader — one request, a file that already exists.
 
-        # One attempt PER ACCOUNT, waterfalling on the two answers that mean "this key is
-        # done here" and nothing else: 429 (monthly quota spent) and 403 (this account isn't
-        # subscribed to this product). Every other failure still falls straight through to
-        # the CDN provider, since retrying a slow transcode on another key would cost ~90s
-        # to learn nothing. The loop terminates on its own: the rotator only ever moves
-        # forward and hands back (None, None) once every account is written off.
-        #
-        # Generous read timeout because this provider transcodes server-side BEFORE it
-        # streams a single byte, so the first byte can take ~40-50s. The old 30s read-timeout
-        # cut that off mid-transcode and forced a wasteful retry, which is exactly what made
-        # scans feel slow. 90s covers virtually any transcode; once bytes start flowing the
-        # partial cap stops us in ~1s.
+        GET /get_m4a_download_link/{video_id} answers immediately with:
+
+            {"comment": "The file is ready for download. ... only 10 minutes",
+             "file":          "https://s7.<host>/dl_<id>-<hash>.m4a",
+             "reserved_file": "https://s7.<mirror>/dl_<id>-<hash>.m4a"}
+
+        No transcode queue, no progress stream, no waiting: the file is prepared before the
+        response is sent. Verified 2026-08-16 against vjWwR5FGj1k, the exact video that had
+        failed every other route all night — 200, application/octet-stream, 4.2 MB in 1.5s,
+        valid `ftypisom` header.
+
+        That is why this replaced youtube-mp3-2025 / youtube-convert-mp3-m4a entirely. Those
+        two were the same zm.io.vn service behind different RapidAPI listings, they handed
+        back a link to a file they had not built yet, and their own progress stream ended in
+        "Download failed or timeout" because they could not read the video from YouTube.
+
+        Two links, both used: `file` first, `reserved_file` as the mirror. Costs nothing
+        extra since only the API call above counts against the RapidAPI quota — the file
+        hosts are outside it.
+
+        Note: the API replies with Content-Type text/html while sending JSON, so the body is
+        parsed directly instead of trusting the header.
+        """
+        url = f"https://{self.rapidapi_sync_host}/get_m4a_download_link/{video_id}"
+
+        # One attempt PER ACCOUNT, advancing only on the two answers that mean this key is
+        # finished here: 429 (monthly quota spent) and 403 (not subscribed to this product).
         while True:
-            sync_label, sync_key = self.sync_key_rotator.current()
-            if sync_key is None:
-                logger.error("❌ [sync] No usable RapidAPI account left for this provider")
+            label, key = self.sync_key_rotator.current()
+            if key is None:
+                logger.error("❌ [dl] No usable RapidAPI account left")
                 return False
 
             headers = {
                 'Content-Type': 'application/json',
                 'x-rapidapi-host': self.rapidapi_sync_host,
-                'x-rapidapi-key': sync_key,
+                'x-rapidapi-key': key,
             }
 
             try:
-                logger.info(f"🚀 [sync] Requesting M4A: id={video_id} (account: {sync_label})")
-                r = requests.get(url, headers=headers, timeout=(10, 90), stream=True)
+                logger.info(f"🚀 [dl] Requesting download link: id={video_id} (account: {label})")
+                r = requests.get(url, headers=headers, timeout=(10, 90))
             except requests.exceptions.RequestException as e:
-                logger.warning(f"⚠️ [sync] Request failed: {e}")
+                logger.warning(f"⚠️ [dl] Request failed: {e}")
                 return False
 
-            # Records usage against the key that actually made the call, and advances on its
-            # own when RapidAPI's remaining-requests header says this was the last one.
-            switched = self.sync_key_rotator.note_response(r.headers, used_label=sync_label)
+            switched = self.sync_key_rotator.note_response(r.headers, used_label=label)
 
             if r.status_code in (403, 429):
-                body = r.text[:200]
-                r.close()
-                logger.warning(f"⚠️ [sync] {r.status_code} on '{sync_label}': {body}")
+                logger.warning(f"⚠️ [dl] {r.status_code} on '{label}': {r.text[:160]}")
                 if not switched:
                     reason = ('is not subscribed to this API' if r.status_code == 403
                               else 'is out of monthly quota')
-                    switched = self.sync_key_rotator.mark_unusable(sync_label, reason)
+                    switched = self.sync_key_rotator.mark_unusable(label, reason)
                 if switched:
                     continue
-                logger.error("❌ [sync] Every configured account is spent on this provider")
+                logger.error("❌ [dl] Every configured account is spent")
                 return False
-
             break
 
         if r.status_code != 200:
-            logger.warning(f"⚠️ [sync] Non-200: {r.status_code} - {r.text[:200]}")
-            return False
-
-        ctype = r.headers.get('content-type', '')
-        if 'octet-stream' not in ctype and 'audio' not in ctype:
-            logger.warning(f"⚠️ [sync] Unexpected content-type: {ctype}")
-            return False
-
-        written = 0
-        with open(raw_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    written += len(chunk)
-                    if max_bytes and written >= max_bytes:
-                        break
-        r.close()
-        logger.info(f"✅ [sync] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
-        return True
-
-    def _await_cdn_conversion(self, progress_url, deadline):
-        """Watch this provider's transcode until it finishes, reconnecting as needed.
-
-        `linkDownloadProgress` is a Server-Sent Events URL, not a percentage. Its events look
-        like:
-
-            event:progress
-            data:{"elapsed_time":0.09,"ext":"m4a","progress":25,"quality":"default",
-                  "status":"in_progress","video_id":"vjWwR5FGj1k"}
-
-        Three things learned the hard way on 2026-08-15, all of them load-bearing:
-
-        1. The stream gets cut mid-transcode ("Response ended prematurely" at 25%). That is
-           routine for a long-lived SSE and says nothing about the job, so a drop means
-           reconnect to the SAME url, not give up.
-        2. Giving up meant asking the API for a new link, and a new link is a new CDN node
-           (cdn-ytb -> cdn-ytb-247 / cdn-ytb-mega in the same scan) which restarts the
-           transcode from 0%. Every retry threw away the progress it was waiting on.
-        3. The read timeout has to be per-connection. It was being derived from the time left
-           in the whole budget, so late attempts got a 13s timeout and were killed while the
-           transcode was healthy and advancing.
-        """
-        last_progress = -1
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            try:
-                with requests.get(progress_url, stream=True, timeout=(10, min(45, remaining))) as sse:
-                    if sse.status_code != 200:
-                        logger.warning(f"⚠️ [cdn] progress stream returned {sse.status_code}")
-                        return 'unknown' 
-                    for line in sse.iter_lines(decode_unicode=True):
-                        if time.time() > deadline:
-                            logger.warning(f"⚠️ [cdn] transcode still at {last_progress}% at the deadline")
-                            return 'unknown' 
-                        if not line or not line.startswith('data:'):
-                            continue
-                        try:
-                            ev = json.loads(line[5:].strip())
-                        except ValueError:
-                            continue
-                        status = str(ev.get('status', '')).lower()
-                        progress = ev.get('progress')
-                        if isinstance(progress, (int, float)) and progress != last_progress:
-                            last_progress = progress
-                            logger.info(f"📶 [cdn] transcode {progress}% ({status or 'n/a'})")
-                        if status in ('error', 'failed', 'failure'):
-                            # The provider itself says it could not fetch the video from
-                            # YouTube ("Download failed or timeout"). Reproduced by hand
-                            # against the CDN with a fresh token: it is their fetch that
-                            # fails, not our request. Distinguished from an unknown outcome
-                            # so the caller can stop now instead of burning the whole budget
-                            # hammering a file that will never exist.
-                            logger.error(f"❌ [cdn] provider reported {status}: "
-                                         f"{str(ev.get('message'))[:160]}")
-                            return 'error' 
-                        if status in ('done', 'completed', 'complete', 'finished', 'success')                                 or (isinstance(progress, (int, float)) and progress >= 100):
-                            logger.info("✅ [cdn] transcode complete")
-                            return 'done' 
-            except requests.exceptions.RequestException as e:
-                # A dropped stream is not a failed transcode — reconnect and keep watching.
-                logger.info(f"↻ [cdn] progress stream dropped at {last_progress}% "
-                            f"({e.__class__.__name__}) — reconnecting")
-                time.sleep(2)
-                continue
-            # Closed cleanly with no terminal event: this provider ends the stream when the
-            # job is done, so that IS the completion signal.
-            logger.info(f"✅ [cdn] progress stream closed at {last_progress}% — treating as complete")
-            return 'done' 
-
-        logger.warning(f"⚠️ [cdn] transcode still at {last_progress}% at the deadline")
-        return 'unknown' 
-
-    def _fetch_raw_via_cdn_api(self, video_id, raw_path, max_bytes=None):
-        """Youtube Convert MP3/M4A — EXACTLY ONE RapidAPI request per beat.
-
-        That budget is the whole design. The plan is 300 requests/month and a beat has to
-        cost one of them, so the API is called once, for the link, and never again for the
-        same video. Everything after that (the progress stream, the download, every retry)
-        goes straight to the CDN host, which is outside RapidAPI and free.
-
-        The previous version could spend six requests on a single failing beat, which is how
-        a quota meant to cover 300 scans covered 50.
-
-        ── quality=128kbps is load-bearing ──────────────────────────────────────────
-        The endpoint's own docs: "If quality is missing/invalid, it defaults to audio."
-        Omitting it lands on quality=default, which makes the provider transcode on demand —
-        the slow, fragile path that produced hours of 504s, "status":"error" and restarted
-        conversions on 2026-08-15. 128kbps is the native rate, so the file is served as it
-        already exists. 64kbps (the original setting) is a real option but transcodes too.
-        Do not remove this parameter, and do not "optimise" it downwards.
-        """
-        info_url = f"https://{self.rapidapi_host}/v1/social/youtube/audio"
-        params = {'id': video_id, 'ext': 'm4a', 'quality': '128kbps'}
-        headers = {
-            'x-rapidapi-key': self.rapidapi_key,
-            'x-rapidapi-host': self.rapidapi_host,
-        }
-
-        if not self.rapidapi_key:
-            logger.error("❌ [cdn] RAPIDAPI_KEY not set")
-            return False
-
-        download_start = time.time()
-        # 170s total, under app.py's MAX_JOB_SECONDS (240s), leaving ~70s for ACRCloud +
-        # Spotify + the response. Nothing HTTP is waiting on this: POST /scan already
-        # returned 202 and the work runs in its own thread (app.py's _run_job).
-        deadline = download_start + 170
-
-        # ── The one and only RapidAPI call ──────────────────────────────────────────
-        try:
-            logger.info(f"🚀 [cdn] Requesting audio link (1 request): id={video_id}")
-            info_resp = requests.get(info_url, headers=headers, params=params, timeout=(10, 60))
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ [cdn] API call failed: {e}")
-            return False
-
-        record_api_usage('youtube-convert-mp3-m4a', info_resp.headers)
-
-        if info_resp.status_code != 200:
-            logger.error(f"❌ [cdn] RapidAPI error: {info_resp.status_code} - {info_resp.text[:300]}")
+            logger.warning(f"⚠️ [dl] Non-200: {r.status_code} - {r.text[:200]}")
             return False
 
         try:
-            data = info_resp.json()
+            data = r.json()
         except ValueError:
-            logger.error(f"❌ [cdn] non-JSON response: {info_resp.text[:200]}")
+            logger.error(f"❌ [dl] non-JSON response: {r.text[:200]}")
             return False
 
-        if data.get('error'):
-            logger.error(f"❌ [cdn] API returned an error: {str(data.get('error'))[:200]}")
+        links = [u for u in (data.get('file'), data.get('reserved_file')) if u]
+        if not links:
+            logger.error(f"❌ [dl] no download link in response: {str(data)[:200]}")
             return False
+        logger.info(f"🔎 [dl] link ready ({len(links)} host(s)) — {str(data.get('comment'))[:80]}")
 
-        download_url = data.get('linkDownload') or data.get('linkStream')
-        progress_url = data.get('linkDownloadProgress')
-        logger.info(f"🔎 [cdn] link acquired for \"{str(data.get('title'))[:60]}\" "
-                    f"({data.get('lengthSeconds')}s), progress={'yes' if progress_url else 'no'}")
-
-        if not download_url:
-            logger.error("❌ [cdn] payload carried no download link")
-            return False
-
-        # ── Everything below is CDN-only: no quota is consumed ──────────────────────
-        if progress_url:
-            outcome = self._await_cdn_conversion(progress_url, deadline)
-            if outcome == 'error':
-                # Their fetch from YouTube failed. The file will never appear, so retrying
-                # the link for the remaining ~160s only delays the failure the user sees.
-                logger.error("❌ [cdn] provider could not fetch this video — giving up now")
-                return False
-
-        file_resp = None
-        attempt = 0
-        while time.time() < deadline and file_resp is None:
-            attempt += 1
+        for i, link in enumerate(links):
+            which = 'primary' if i == 0 else 'mirror'
             try:
-                r = requests.get(download_url, timeout=(10, 120), stream=True)
-                ctype = r.headers.get('content-type', '')
-                if r.status_code == 200 and ('audio' in ctype or 'mp4' in ctype or 'octet-stream' in ctype):
-                    file_resp = r
-                    break
-                body = ''
-                try:
-                    body = r.text[:160]
-                except Exception:
-                    pass
-                logger.warning(f"⚠️ [cdn] download attempt {attempt}: status={r.status_code} type={ctype} body={body}")
-                r.close()
+                fr = requests.get(link, timeout=(10, 120), stream=True)
             except requests.exceptions.RequestException as e:
-                logger.warning(f"⚠️ [cdn] download attempt {attempt} failed: {e}")
-            time.sleep(6)
+                logger.warning(f"⚠️ [dl] {which} host failed: {e}")
+                continue
 
-        if not file_resp:
-            logger.error(f"❌ [cdn] Could not download the M4A within {int(time.time() - download_start)}s "
-                         f"after {attempt} attempt(s) on the same link")
-            return False
+            ctype = fr.headers.get('content-type', '')
+            if fr.status_code != 200 or not ('audio' in ctype or 'mp4' in ctype or 'octet-stream' in ctype):
+                logger.warning(f"⚠️ [dl] {which} host: status={fr.status_code} type={ctype}")
+                fr.close()
+                continue
 
-        logger.info("⬇️ [cdn] CDN ready — downloading M4A...")
-        written = 0
-        with open(raw_path, 'wb') as f:
-            for chunk in file_resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    written += len(chunk)
-                    if max_bytes and written >= max_bytes:
-                        break
-        file_resp.close()
-        logger.info(f"✅ [cdn] M4A downloaded ({written // 1024} KB, partial={bool(max_bytes)})")
-        return True
+            written = 0
+            with open(raw_path, 'wb') as f:
+                for chunk in fr.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        written += len(chunk)
+                        if max_bytes and written >= max_bytes:
+                            break
+            fr.close()
+            logger.info(f"✅ [dl] M4A downloaded from {which} ({written // 1024} KB, partial={bool(max_bytes)})")
+            return True
+
+        logger.error("❌ [dl] every download host refused the file")
+        return False
 
     def _extract_30s(self, raw_path, video_id):
         """
@@ -643,20 +457,10 @@ class YouTubeService:
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
 
-            # Fast path first, when it is worth calling at all; the slower CDN poller runs
-            # either way if it fails. See SYNC_PROVIDER_ENABLED for why it is currently off.
-            winner = None
-            if SYNC_PROVIDER_ENABLED and self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
-                winner = 'sync'
-            else:
-                if SYNC_PROVIDER_ENABLED:
-                    logger.warning("⚠️ Sync provider failed — falling back to CDN provider...")
-                if self._fetch_raw_via_cdn_api(video_id, raw_path, PARTIAL_CAP_BYTES):
-                    winner = 'cdn'
-
-            if not winner:
-                logger.error("❌ Audio download failed on every enabled provider")
+            if not self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+                logger.error("❌ Audio download failed")
                 return None
+            winner = 'dl'
 
             m4a_path = self._extract_30s(raw_path, video_id)
             if m4a_path:
@@ -665,7 +469,7 @@ class YouTubeService:
             # Partial slice couldn't be decoded — re-download the FULL file from the winner.
             logger.warning(f"⚠️ Partial extract failed — re-downloading full file from [{winner}]...")
             full_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_full.m4a')
-            fetch_fn = self._fetch_raw_via_sync_api if winner == 'sync' else self._fetch_raw_via_cdn_api
+            fetch_fn = self._fetch_raw_via_sync_api
             if not fetch_fn(video_id, full_path, None):
                 logger.error("❌ Full re-download failed")
                 return None
