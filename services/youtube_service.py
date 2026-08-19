@@ -395,18 +395,50 @@ class YouTubeService:
         logger.error(f"❌ [dl] file never became available within {PREP_BUDGET_S}s")
         return False
 
+    @staticmethod
+    def _sniff_audio_ext(path):
+        """Le vrai format du fichier, lu dans ses premiers octets et non dans son nom.
+
+        raw_path se termine par .m4a depuis toujours, mais le fournisseur sert du MP3 depuis
+        le passage a /get_mp3_download_link : se fier a l'extension revient a se tromper de
+        conteneur a coup sur.
+        """
+        try:
+            with open(path, 'rb') as f:
+                head = f.read(12)
+        except OSError:
+            return 'mp3'
+        if head[:3] == b'ID3':
+            return 'mp3'
+        # En-tete de trame MPEG : 11 bits a 1 (0xFF puis les 3 bits hauts de l'octet suivant).
+        # Compare en entiers plutot qu'en litteraux d'octets, qui ne survivent pas a une
+        # double interpretation.
+        if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+            return 'mp3'
+        if head[4:8] == b'ftyp':
+            return 'm4a'
+        return 'mp3'
+
     def _extract_30s(self, raw_path, video_id):
         """
         FFmpeg-extract the 30s ACRCloud slice (from the 15s mark) out of raw_path.
-        Returns the m4a path, or None if extraction failed (e.g. a partial download that
-        truncated the container's moov atom, which the caller handles by re-downloading
-        the full file). Always removes raw_path.
+        Returns the sliced file's path, or None if extraction failed. Always removes
+        raw_path.
+
+        Le conteneur de SORTIE suit le codec d'ENTREE. La sortie etait figee en .m4a avec
+        -acodec copy : un flux MP3 n'a pas de tag dans un conteneur MP4, donc ffmpeg
+        s'arretait sur "could not find tag for codec mp3 in stream #0, codec not currently
+        supported in container" des que le fournisseur est passe au MP3. L'appelant lisait
+        cet echec comme un telechargement partiel corrompu et relancait un telechargement
+        complet, qui echouait au meme endroit : le scan tournait en boucle sans jamais
+        aboutir. ACRCloud prend le MP3 comme le M4A, il n'y a rien a reencoder.
         """
         if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
             return None
 
-        m4a_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.m4a')
-        logger.info("🔄 Extracting 30 seconds (optimized for ACR Cloud)...")
+        ext = self._sniff_audio_ext(raw_path)
+        m4a_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.{ext}')
+        logger.info(f"🔄 Extracting 30 seconds as {ext} (optimized for ACR Cloud)...")
         try:
             ffmpeg_result = subprocess.run(
                 [
