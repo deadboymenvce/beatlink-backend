@@ -69,7 +69,11 @@ MAX_QUEUE_WAIT_SECONDS = 90
 # A job running longer than this is reported as failed. The thread can't be killed
 # from outside in Python, so this doesn't free the slot — it stops the API telling a
 # caller that something is still working when it has clearly stopped.
-MAX_JOB_SECONDS = 4 * 60
+# 5 minutes. Le fournisseur audio prepare le fichier en differe (20 a 300s annoncees, ~120s
+# mesurees) et renvoie 404 sur le lien tant qu'il n'est pas pret : youtube_service attend
+# jusqu'a PREP_BUDGET_S = 210s avant de rendre la main. Les 4 minutes precedentes coupaient
+# le job pendant cette attente, donc avant ACRCloud et Spotify.
+MAX_JOB_SECONDS = 5 * 60
 JOB_RETENTION_SECONDS = 60 * 60  # prune finished jobs after 1h so memory can't grow unbounded
 
 _jobs = {}

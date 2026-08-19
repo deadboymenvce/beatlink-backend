@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 # past the 45s the FFmpeg extract needs, with margin for the container's framing.
 PARTIAL_CAP_BYTES = 1_500_000
 
+# Le fournisseur annonce "from 20 to 300 seconds" pour preparer le fichier, et renvoie 404
+# sur le lien tant qu'il n'est pas pret. Mesure : ~120s sur AZAgmSoNHgM. 210s couvre
+# largement le cas courant sans laisser un scan pendre jusqu'au plafond du job (app.py
+# MAX_JOB_SECONDS), qui doit rester au-dessus pour laisser passer ACRCloud et Spotify.
+PREP_BUDGET_S = 210
+POLL_EVERY_S = 10
+
 def _iso8601_seconds(duration):
     """PT4M13S → 253. Returns 0 for anything unparseable, which drops the video rather
     than letting an unknown length through as if it were a full beat."""
@@ -265,35 +272,37 @@ class YouTubeService:
             }
 
     def _fetch_raw_via_sync_api(self, video_id, raw_path, max_bytes=None):
-        """YouTube MP3 Audio Video Downloader — one request, a file that already exists.
+        """YouTube MP3 Audio Video Downloader, endpoint MP3, avec attente de preparation.
 
-        GET /get_m4a_download_link/{video_id} answers immediately with:
+        GET /get_mp3_download_link/{video_id} repond en ~3s :
 
-            {"comment": "The file is ready for download. ... only 10 minutes",
-             "file":          "https://s7.<host>/dl_<id>-<hash>.m4a",
-             "reserved_file": "https://s7.<mirror>/dl_<id>-<hash>.m4a"}
+            {"comment": "The file will soon be ready (from 20 to 300 seconds). Until it is
+                         ready, attempting to access it will return a 404 error. The file
+                         will be available for download only 10 minutes",
+             "file":          "https://s2-audio.<host>/dl_<id>-<hash>.mp3",
+             "reserved_file": "https://s2-audio.<mirror>/dl_<id>-<hash>.mp3"}
 
-        No transcode queue, no progress stream, no waiting: the file is prepared before the
-        response is sent. Verified 2026-08-16 against vjWwR5FGj1k, the exact video that had
-        failed every other route all night — 200, application/octet-stream, 4.2 MB in 1.5s,
-        valid `ftypisom` header.
+        DEUX corrections d'un diagnostic errone du 2026-08-16, verifiees a la main :
 
-        That is why this replaced youtube-mp3-2025 / youtube-convert-mp3-m4a entirely. Those
-        two were the same zm.io.vn service behind different RapidAPI listings, they handed
-        back a link to a file they had not built yet, and their own progress stream ended in
-        "Download failed or timeout" because they could not read the video from YouTube.
+        1. L'ENDPOINT. /get_m4a_download_link renvoie desormais 524 (Cloudflare : l'origine
+           ne repond pas) apres ~125s sur toutes les videos essayees. /get_mp3_download_link
+           repond 200 en 3.4s sur les memes. Seule la variante M4A est cassee chez eux. Un
+           MP3 convient parfaitement : ACRCloud prend une empreinte, il n'ecoute pas.
 
-        Two links, both used: `file` first, `reserved_file` as the mirror. Costs nothing
-        extra since only the API call above counts against the RapidAPI quota — the file
-        hosts are outside it.
+        2. LE 404 N'EST PAS UN ECHEC. Le fichier est prepare en differe, et leur propre
+           message le dit : tant qu'il n'est pas pret, le lien renvoie 404. Le code
+           telechargeait le lien immediatement, prenait ce 404 pour un refus definitif et
+           abandonnait. Les "404" du 16 aout, que j'avais lus comme "le fournisseur n'arrive
+           pas a recuperer la video", etaient tout simplement des fichiers en cours de
+           fabrication. Mesure sur AZAgmSoNHgM : pret au bout de ~120s, 3.3 Mo, en-tete ID3
+           valide. Il faut donc POLLER le lien, pas le lire une fois.
 
-        Note: the API replies with Content-Type text/html while sending JSON, so the body is
-        parsed directly instead of trusting the header.
+        Les deux liens (file, puis reserved_file) sont essayes a chaque tour : ce sont deux
+        hotes pour le meme fichier, et l'un peut le publier avant l'autre.
         """
-        url = f"https://{self.rapidapi_sync_host}/get_m4a_download_link/{video_id}"
+        url = f"https://{self.rapidapi_sync_host}/get_mp3_download_link/{video_id}"
 
-        # One attempt PER ACCOUNT, advancing only on the two answers that mean this key is
-        # finished here: 429 (monthly quota spent) and 403 (not subscribed to this product).
+        # ── 1. Le lien : une seule requete RapidAPI par beat ─────────────────
         while True:
             label, key = self.sync_key_rotator.current()
             if key is None:
@@ -305,10 +314,9 @@ class YouTubeService:
                 'x-rapidapi-host': self.rapidapi_sync_host,
                 'x-rapidapi-key': key,
             }
-
             try:
                 logger.info(f"🚀 [dl] Requesting download link: id={video_id} (account: {label})")
-                r = requests.get(url, headers=headers, timeout=(10, 90))
+                r = requests.get(url, headers=headers, timeout=(10, 60))
             except requests.exceptions.RequestException as e:
                 logger.warning(f"⚠️ [dl] Request failed: {e}")
                 return False
@@ -341,35 +349,50 @@ class YouTubeService:
         if not links:
             logger.error(f"❌ [dl] no download link in response: {str(data)[:200]}")
             return False
-        logger.info(f"🔎 [dl] link ready ({len(links)} host(s)) — {str(data.get('comment'))[:80]}")
+        logger.info(f"🔎 [dl] link ready in ~{PREP_BUDGET_S}s max ({len(links)} host(s))")
 
-        for i, link in enumerate(links):
-            which = 'primary' if i == 0 else 'mirror'
-            try:
-                fr = requests.get(link, timeout=(10, 120), stream=True)
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"⚠️ [dl] {which} host failed: {e}")
-                continue
+        # ── 2. L'attente : le 404 veut dire "pas encore pret" ────────────────
+        deadline = time.time() + PREP_BUDGET_S
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            for i, link in enumerate(links):
+                which = 'primary' if i == 0 else 'mirror'
+                try:
+                    fr = requests.get(link, timeout=(10, 120), stream=True)
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"⚠️ [dl] {which} host failed: {e}")
+                    continue
 
-            ctype = fr.headers.get('content-type', '')
-            if fr.status_code != 200 or not ('audio' in ctype or 'mp4' in ctype or 'octet-stream' in ctype):
-                logger.warning(f"⚠️ [dl] {which} host: status={fr.status_code} type={ctype}")
+                if fr.status_code == 404:
+                    fr.close()
+                    continue        # en cours de fabrication, c'est normal
+
+                ctype = fr.headers.get('content-type', '')
+                if fr.status_code != 200 or not ('audio' in ctype or 'mpeg' in ctype
+                                                 or 'mp4' in ctype or 'octet-stream' in ctype):
+                    logger.warning(f"⚠️ [dl] {which} host: status={fr.status_code} type={ctype}")
+                    fr.close()
+                    continue
+
+                written = 0
+                with open(raw_path, 'wb') as f:
+                    for chunk in fr.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+                            if max_bytes and written >= max_bytes:
+                                break
                 fr.close()
-                continue
+                logger.info(f"✅ [dl] downloaded from {which} after {attempt} poll(s), "
+                            f"{int(time.time() - (deadline - PREP_BUDGET_S))}s ({written // 1024} KB, "
+                            f"partial={bool(max_bytes)})")
+                return True
 
-            written = 0
-            with open(raw_path, 'wb') as f:
-                for chunk in fr.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        written += len(chunk)
-                        if max_bytes and written >= max_bytes:
-                            break
-            fr.close()
-            logger.info(f"✅ [dl] M4A downloaded from {which} ({written // 1024} KB, partial={bool(max_bytes)})")
-            return True
+            logger.info(f"⏳ [dl] not ready yet (poll {attempt})")
+            time.sleep(POLL_EVERY_S)
 
-        logger.error("❌ [dl] every download host refused the file")
+        logger.error(f"❌ [dl] file never became available within {PREP_BUDGET_S}s")
         return False
 
     def _extract_30s(self, raw_path, video_id):
