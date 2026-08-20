@@ -84,6 +84,49 @@ def store_artist_cache(spotify_artist_id, payload):
         logger.warning(f"⚠️ artist_scrape_cache upsert failed for {spotify_artist_id}: {e}")
 
 
+def record_key_unusable(api_name, key_label):
+    """Ecrit qu'une cle ne sert a rien pour cette API, alors qu'aucun en-tete ne le dit.
+
+    Un 403 RapidAPI ("You are not subscribed to this API") ne porte AUCUN en-tete
+    x-ratelimit. record_api_usage n'ecrit donc jamais de ligne pour ce couple, et
+    fetch_spent_labels, qui selectionne sur remaining <= 1, ne peut pas le retrouver. La
+    consequence se voyait dans les journaux du 20/08 : le rotateur redecouvrait a CHAQUE
+    demarrage de processus que prodconnect512 n'est pas abonne, au prix d'un aller-retour
+    perdu et d'un WARNING trompeur, alors que la reponse etait connue depuis la veille.
+
+    remaining = 0 est le vocabulaire que fetch_spent_labels comprend deja : on ne lui
+    apprend pas un nouveau concept, on ecrit dans le sien. limit_value reste nul, ce qui
+    distingue une cle non abonnee d'une cle a quota epuise si on lit la table a la main.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return
+    row = {
+        "api_name": api_name,
+        "key_label": key_label or "default",
+        "limit_value": None,
+        "remaining": 0,
+        "reset_seconds": None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        requests.post(
+            f"{_SUPABASE_URL}/rest/v1/api_usage_status?on_conflict=api_name,key_label",
+            headers={
+                "apikey": _SUPABASE_KEY,
+                "Authorization": f"Bearer {_SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            json=[row],
+            timeout=5,
+        )
+        logger.info(f"📝 {api_name}: '{row['key_label']}' recorded as not subscribed, "
+                    f"future restarts will skip it")
+    except Exception as e:  # ne doit jamais casser une vraie requete
+        logger.warning(f"⚠️ api_usage_status write-off failed for {api_name} "
+                       f"({row['key_label']}): {e}")
+
+
 def fetch_spent_labels(api_name, floor=1):
     """Key labels this API has already been told are out of quota, read back from the same
     table record_api_usage writes to.

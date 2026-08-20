@@ -1,7 +1,7 @@
 import os
 import logging
 import threading
-from services.api_usage_tracker import record_api_usage, fetch_spent_labels
+from services.api_usage_tracker import record_api_usage, fetch_spent_labels, record_key_unusable
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,15 @@ class KeyRotator:
             active_label, _ = self._current_locked()
             if active_label is None or (used_label is not None and used_label != active_label):
                 return False
-            return self._advance_locked(reason, active_label)
+            switched = self._advance_locked(reason, active_label)
+        # Hors du verrou : c'est un appel reseau, et le tenir sous le verrou bloquerait les
+        # quatre travailleurs paralleles de l'enrichissement pendant sa duree.
+        #
+        # Sans cette ligne la mise a l'ecart ne vivait qu'en memoire, donc mourait avec le
+        # processus. Render arrete le service au repos, et chaque reveil repayait la meme
+        # decouverte : un 403 sur la premiere cle avant de passer a la bonne.
+        record_key_unusable(self.api_name, active_label)
+        return switched
 
     def usable_accounts(self, limit=None):
         """Every account still worth trying, starting at the cursor, WITHOUT mutating
