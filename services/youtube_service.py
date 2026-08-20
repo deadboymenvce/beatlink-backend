@@ -11,17 +11,32 @@ from services.key_rotation import KeyRotator
 
 logger = logging.getLogger(__name__)
 
-# We only ever keep a 30s slice (from the 15s mark) for ACRCloud, so there's no reason to
-# pull the whole 3-4 min file. ~1.5 MB covers ~90s @128kbps / ~180s @64kbps — always well
-# past the 45s the FFmpeg extract needs, with margin for the container's framing.
-PARTIAL_CAP_BYTES = 1_500_000
+# Le fournisseur decoupe lui-meme, cote serveur. On ne demande donc que 30 secondes de son
+# a partir de la 30e, au lieu de telecharger 4 minutes pour en jeter 95%. Demarrer a 30s et
+# non a 0 evite les intros et les tags vocaux, qui degradent l'empreinte ACRCloud.
+#
+# Le fichier rendu fait ~730 Ko en Ogg/Opus 64 kbps. Mesure du 20/08 sur b6sEej3QfyU :
+# 115,0 s et 2 043 233 octets sans decoupage, 40,0 s et 732 722 octets avec. Le decoupage
+# est donc bien applique cote serveur, meme si le champ "size" de la reponse, lui, renvoie
+# la taille du morceau entier dans les deux cas.
+TRIM_START_S = 30
+TRIM_DURATION_S = 30
+AUDIO_QUALITY = 251          # itag YouTube : opus 64 kbps
 
-# Le fournisseur annonce "from 20 to 300 seconds" pour preparer le fichier, et renvoie 404
-# sur le lien tant qu'il n'est pas pret. Mesure : ~120s sur AZAgmSoNHgM. 210s couvre
-# largement le cas courant sans laisser un scan pendre jusqu'au plafond du job (app.py
-# MAX_JOB_SECONDS), qui doit rester au-dessus pour laisser passer ACRCloud et Spotify.
-PREP_BUDGET_S = 210
-POLL_EVERY_S = 10
+# Le lien renvoye repond 404 tant que le fichier n'est pas fabrique, exactement comme chez
+# le fournisseur precedent. La difference est le DELAI : l'endpoint rend la main en ~18 s
+# et le fichier est disponible ~2 s plus tard, soit 20 s en tout. Mesure du 20/08 sur
+# 6GmJfKJoFm0, une video jamais demandee a ce fournisseur, donc sans cache possible.
+#
+# Chez le fournisseur precedent la meme mesure donnait ~300 s, ce qui consommait a lui seul
+# la totalite du budget d'un scan et ne laissait rien a ACRCloud ni a Spotify. C'etait la
+# cause de l'incident des 19 et 20 aout, pas un bug de ce fichier.
+#
+# 90 s de budget, soit 45 fois le delai constate. Il ne s'agit pas d'esperer mieux : si le
+# fichier n'est pas la au bout de 90 s, c'est que le fournisseur est en panne, et attendre
+# davantage ne fait que retarder l'echec.
+PREP_BUDGET_S = 90
+POLL_EVERY_S = 3
 
 def _iso8601_seconds(duration):
     """PT4M13S → 253. Returns 0 for anything unparseable, which drops the video rather
@@ -45,22 +60,26 @@ class YouTubeService:
         self.api_key = os.getenv("YOUTUBE_API_KEY")
         # RapidAPI key (account-wide, same key covers both hosts below). Set RAPIDAPI_KEY on Render.
         self.rapidapi_key = os.getenv("RAPIDAPI_KEY")
-        # Primary: synchronous, returns the M4A directly in one request (fast, ~30s observed).
-        # Marked [Deprecated!!] in the RapidAPI dashboard but still live and working as of
-        # 2026-07-17 — kept as the fast path anyway since a dead/removed endpoint just fails
-        # fast and falls through to the CDN path below, never a regression either way.
-        self.rapidapi_sync_host = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
-        # zm.io.vn (sold on RapidAPI as youtube-mp3-2025, then as youtube-convert-mp3-m4a)
-        # is gone. Both listings were the same service: they returned a link to a file they
-        # had not built yet, and their progress stream ended in "Download failed or timeout"
-        # because they could not read the video from YouTube. Removed 2026-08-16 after a full
-        # evening of failed scans. There is one provider now, the one above.
-        # Waterfalls through the account pool: RAPIDAPI_KEY (slot 1, prodconnect512) is out of
-        # monthly quota and answers 429, so the rotator moves to RAPIDAPI_KEY_POOL_2
-        # (777asthma), which is subscribed and working as of 2026-08-16. Slots 3-8 are not
-        # subscribed yet and will answer 403 until they are; the rotator writes each one off
-        # on that answer and carries on, so adding them later needs no code change.
-        self.sync_key_rotator = KeyRotator('youtube-mp3-audio-video-downloader', 'prodconnect@gmail.com', 'RAPIDAPI_KEY')
+        # youtube-video-fast-downloader-24-7. Une seule requete par scan : l'endpoint
+        # /download_audio rend un lien, et les sondages de ce lien tapent directement le CDN
+        # du fournisseur, hors marketplace, donc ne consomment pas de quota.
+        #
+        # Le fournisseur precedent (youtube-mp3-audio-video-downloader) a ete retire. Ce
+        # n'etait pas une panne passagere : sa route synchrone /download-m4a est classee
+        # Deprecated chez lui et repond 524 apres 125 s, et sa route asynchrone mettait
+        # jusqu'a 300 s a fabriquer le fichier alors qu'un scan entier n'a que 300 s. Les
+        # deux fournisseurs partagent d'ailleurs la meme infrastructure (memes hotes CDN
+        # s7.12388101.xyz et s7.postixx.de, meme format de hash) : c'est le meme service
+        # revendu deux fois. Ce qui change ici, et qui seul justifie la bascule, c'est que
+        # cette fiche expose trim_start_time / trim_duration, donc un fragment a fabriquer
+        # au lieu d'un morceau entier.
+        self.rapidapi_sync_host = "youtube-video-fast-downloader-24-7.p.rapidapi.com"
+        # La cascade de comptes est inchangee. L'abonnement a cette API n'existe pour
+        # l'instant que sur le compte 777asthma (RAPIDAPI_KEY_POOL_2) : le slot 1 repondra
+        # donc 403, le rotateur le retirera et passera au suivant tout seul, sans qu'on ait
+        # a coder le cas. Abonner les autres comptes plus tard ne demandera aucun code.
+        self.sync_key_rotator = KeyRotator('youtube-video-fast-downloader-24-7',
+                                           'prodconnect512@gmail.com', 'RAPIDAPI_KEY')
 
         if self.api_key:
             logger.info("✅ YOUTUBE_API_KEY configured")
@@ -73,7 +92,7 @@ class YouTubeService:
             logger.error("❌ RAPIDAPI_KEY not set")
         
         logger.info(f"📁 Temp directory: {self.temp_dir}")
-        logger.info(f"🎬 Using RapidAPI: {self.rapidapi_sync_host}")
+        logger.info(f"🎬 Using RapidAPI: {self.rapidapi_sync_host} (trim {TRIM_START_S}s+{TRIM_DURATION_S}s, quality {AUDIO_QUALITY})")
 
     def _extract_video_id(self, url):
         """Extract video ID from various YouTube URL formats"""
@@ -271,36 +290,27 @@ class YouTubeService:
                 'message': f'Error: {str(e)}'
             }
 
-    def _fetch_raw_via_sync_api(self, video_id, raw_path, max_bytes=None):
-        """YouTube MP3 Audio Video Downloader, endpoint MP3, avec attente de preparation.
+    def _fetch_raw_via_sync_api(self, video_id, raw_path):
+        """Une requete RapidAPI, puis le fichier deja decoupe a 30 secondes.
 
-        GET /get_mp3_download_link/{video_id} repond en ~3s :
+        GET /download_audio/{id}?quality=251&trim_start_time=30&trim_duration=30 bloque
+        ~18 s puis repond :
 
-            {"comment": "The file will soon be ready (from 20 to 300 seconds). Until it is
-                         ready, attempting to access it will return a 404 error. The file
-                         will be available for download only 10 minutes",
-             "file":          "https://s2-audio.<host>/dl_<id>-<hash>.mp3",
-             "reserved_file": "https://s2-audio.<mirror>/dl_<id>-<hash>.mp3"}
+            {"size": ..., "bitrate": 64000, "type": "audio",
+             "mime": "audio/m4a; codecs=...",          <- mensonge, le fichier est de l'Opus
+             "file":          "https://s2-audio.<hote>/dl_<id>-<hash>.opus",
+             "reserved_file": "https://s7.<miroir>/dl_<id>-<hash>.opus"}
 
-        DEUX corrections d'un diagnostic errone du 2026-08-16, verifiees a la main :
+        Le champ "mime" annonce du m4a alors que l'extension et le contenu reel sont de
+        l'Ogg/Opus (en-tete "OggS", verifie a ffprobe). On ne s'y fie donc pas, et c'est la
+        raison pour laquelle l'etape suivante reencode au lieu de copier le flux.
 
-        1. L'ENDPOINT. /get_m4a_download_link renvoie desormais 524 (Cloudflare : l'origine
-           ne repond pas) apres ~125s sur toutes les videos essayees. /get_mp3_download_link
-           repond 200 en 3.4s sur les memes. Seule la variante M4A est cassee chez eux. Un
-           MP3 convient parfaitement : ACRCloud prend une empreinte, il n'ecoute pas.
-
-        2. LE 404 N'EST PAS UN ECHEC. Le fichier est prepare en differe, et leur propre
-           message le dit : tant qu'il n'est pas pret, le lien renvoie 404. Le code
-           telechargeait le lien immediatement, prenait ce 404 pour un refus definitif et
-           abandonnait. Les "404" du 16 aout, que j'avais lus comme "le fournisseur n'arrive
-           pas a recuperer la video", etaient tout simplement des fichiers en cours de
-           fabrication. Mesure sur AZAgmSoNHgM : pret au bout de ~120s, 3.3 Mo, en-tete ID3
-           valide. Il faut donc POLLER le lien, pas le lire une fois.
-
-        Les deux liens (file, puis reserved_file) sont essayes a chaque tour : ce sont deux
-        hotes pour le meme fichier, et l'un peut le publier avant l'autre.
+        Les deux liens sont essayes a chaque tour : ce sont deux hotes pour le meme fichier
+        et l'un peut le publier avant l'autre.
         """
-        url = f"https://{self.rapidapi_sync_host}/get_mp3_download_link/{video_id}"
+        url = (f"https://{self.rapidapi_sync_host}/download_audio/{video_id}"
+               f"?quality={AUDIO_QUALITY}&trim_start_time={TRIM_START_S}"
+               f"&trim_duration={TRIM_DURATION_S}")
 
         # ── 1. Le lien : une seule requete RapidAPI par beat ─────────────────
         while True:
@@ -316,7 +326,9 @@ class YouTubeService:
             }
             try:
                 logger.info(f"🚀 [dl] Requesting download link: id={video_id} (account: {label})")
-                r = requests.get(url, headers=headers, timeout=(10, 60))
+                # 120 s de lecture et non 60 : l'endpoint fabrique le fragment AVANT de
+                # repondre, il bloque donc ~18 s, parfois plus sur une longue video.
+                r = requests.get(url, headers=headers, timeout=(10, 120))
             except requests.exceptions.RequestException as e:
                 logger.warning(f"⚠️ [dl] Request failed: {e}")
                 return False
@@ -353,6 +365,7 @@ class YouTubeService:
 
         # ── 2. L'attente : le 404 veut dire "pas encore pret" ────────────────
         deadline = time.time() + PREP_BUDGET_S
+        started = time.time()
         attempt = 0
         while time.time() < deadline:
             attempt += 1
@@ -368,9 +381,11 @@ class YouTubeService:
                     fr.close()
                     continue        # en cours de fabrication, c'est normal
 
+                # 'ogg' ajoute a la liste : c'est le type que ce fournisseur renvoie.
                 ctype = fr.headers.get('content-type', '')
-                if fr.status_code != 200 or not ('audio' in ctype or 'mpeg' in ctype
-                                                 or 'mp4' in ctype or 'octet-stream' in ctype):
+                if fr.status_code != 200 or not ('audio' in ctype or 'ogg' in ctype
+                                                 or 'mpeg' in ctype or 'mp4' in ctype
+                                                 or 'octet-stream' in ctype):
                     logger.warning(f"⚠️ [dl] {which} host: status={fr.status_code} type={ctype}")
                     fr.close()
                     continue
@@ -381,12 +396,9 @@ class YouTubeService:
                         if chunk:
                             f.write(chunk)
                             written += len(chunk)
-                            if max_bytes and written >= max_bytes:
-                                break
                 fr.close()
                 logger.info(f"✅ [dl] downloaded from {which} after {attempt} poll(s), "
-                            f"{int(time.time() - (deadline - PREP_BUDGET_S))}s ({written // 1024} KB, "
-                            f"partial={bool(max_bytes)})")
+                            f"{int(time.time() - started)}s ({written // 1024} KB)")
                 return True
 
             logger.info(f"⏳ [dl] not ready yet (poll {attempt})")
@@ -395,102 +407,68 @@ class YouTubeService:
         logger.error(f"❌ [dl] file never became available within {PREP_BUDGET_S}s")
         return False
 
-    @staticmethod
-    def _sniff_audio_ext(path):
-        """Le vrai format du fichier, lu dans ses premiers octets et non dans son nom.
+    def _to_acr_sample(self, raw_path, video_id):
+        """Normalise le fichier telecharge en un echantillon que ACRCloud recevra.
 
-        raw_path se termine par .m4a depuis toujours, mais le fournisseur sert du MP3 depuis
-        le passage a /get_mp3_download_link : se fier a l'extension revient a se tromper de
-        conteneur a coup sur.
-        """
-        try:
-            with open(path, 'rb') as f:
-                head = f.read(12)
-        except OSError:
-            return 'mp3'
-        if head[:3] == b'ID3':
-            return 'mp3'
-        # En-tete de trame MPEG : 11 bits a 1 (0xFF puis les 3 bits hauts de l'octet suivant).
-        # Compare en entiers plutot qu'en litteraux d'octets, qui ne survivent pas a une
-        # double interpretation.
-        if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
-            return 'mp3'
-        if head[4:8] == b'ftyp':
-            return 'm4a'
-        return 'mp3'
+        On REENCODE, la ou l'ancienne version copiait le flux. Copier imposait de deviner
+        le conteneur juste, et c'est exactement ce qui a casse le 19/08 : un flux MP3 n'a
+        pas de tag dans un conteneur MP4, ffmpeg refusait, et l'echec declenchait un
+        retelechargement complet. Le reencodage de 30 secondes coute une seconde de
+        processeur et supprime toute la classe de bugs.
 
-    def _extract_30s(self, raw_path, video_id):
-        """
-        FFmpeg-extract the 30s ACRCloud slice (from the 15s mark) out of raw_path.
-        Returns the sliced file's path, or None if extraction failed. Always removes
-        raw_path.
+        MP3 vise en premier parce que services/acrcloud_service.py etiquette le fichier en
+        dur ('audio.mp3', 'audio/mpeg') quel que soit son contenu : lui envoyer du MP3 est
+        le seul cas ou l'etiquette dit la verite.
 
-        Le conteneur de SORTIE suit le codec d'ENTREE. La sortie etait figee en .m4a avec
-        -acodec copy : un flux MP3 n'a pas de tag dans un conteneur MP4, donc ffmpeg
-        s'arretait sur "could not find tag for codec mp3 in stream #0, codec not currently
-        supported in container" des que le fournisseur est passe au MP3. L'appelant lisait
-        cet echec comme un telechargement partiel corrompu et relancait un telechargement
-        complet, qui echouait au meme endroit : le scan tournait en boucle sans jamais
-        aboutir. ACRCloud prend le MP3 comme le M4A, il n'y a rien a reencoder.
+        Repli en WAV PCM si l'encodage MP3 echoue. libmp3lame est une bibliotheque externe,
+        absente de certaines compilations de ffmpeg, alors que pcm_s16le est interne et
+        toujours present. render.yaml n'installe pas ffmpeg (il vient de l'image de base),
+        donc le depot ne peut rien garantir sur les encodeurs disponibles : le repli n'est
+        pas de la prudence decorative, c'est la seule reponse a une inconnue reelle.
         """
         if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            logger.error("❌ Downloaded file is missing or empty")
             return None
 
-        ext = self._sniff_audio_ext(raw_path)
-        m4a_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.{ext}')
-        logger.info(f"🔄 Extracting 30 seconds as {ext} (optimized for ACR Cloud)...")
-        try:
-            ffmpeg_result = subprocess.run(
-                [
-                    'ffmpeg',
-                    '-i', raw_path,
-                    '-ss', '15',       # Start at 15 seconds
-                    '-t', '30',        # Extract 30 seconds
-                    '-acodec', 'copy', # Copy without re-encoding (faster, no quality loss)
-                    '-y',              # Overwrite if exists
-                    m4a_path
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-        except Exception as e:
-            logger.error(f"❌ FFmpeg run failed: {e}")
-            if os.path.exists(raw_path):
-                os.remove(raw_path)
-            return None
+        for codec, ext, extra in (('libmp3lame', 'mp3', ['-b:a', '128k']),
+                                  ('pcm_s16le', 'wav', ['-ar', '16000', '-ac', '1'])):
+            out_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.{ext}')
+            try:
+                logger.info(f"🔄 Encoding ACR sample as {ext} ({codec})")
+                res = subprocess.run(
+                    ['ffmpeg', '-y', '-v', 'error', '-i', raw_path,
+                     '-t', '30', '-vn', '-c:a', codec] + extra + [out_path],
+                    capture_output=True, timeout=90,
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ FFmpeg {ext} encode raised: {e}")
+                continue
 
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
+            if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info(f"✅ ACR sample ready: {out_path} "
+                            f"({os.path.getsize(out_path) // 1024} KB)")
+                return out_path
 
-        if ffmpeg_result.returncode != 0:
-            logger.warning(f"⚠️ FFmpeg extract failed (returncode {ffmpeg_result.returncode}): {ffmpeg_result.stderr[-300:]}")
-            return None
+            logger.warning(f"⚠️ FFmpeg {ext} encode failed (rc={res.returncode}): "
+                           f"{res.stderr.decode('utf-8', 'replace')[:200]}")
 
-        if os.path.exists(m4a_path) and os.path.getsize(m4a_path) > 0:
-            logger.info(f"✅ M4A ready: {m4a_path} ({os.path.getsize(m4a_path) // 1024} KB) - 30s extract")
-            return m4a_path
-
+        logger.error("❌ Could not produce an ACR sample in any format")
         return None
 
     def download_audio(self, youtube_url):
-        """
-        Get a 30s M4A slice for ACRCloud. Sequential, sync-provider first.
+        """Rend un echantillon de 30 secondes pour ACRCloud, ou None.
 
-        Order flipped back on 2026-08-16, which is what the CDN-first note here always said
-        to do "once the sync provider's quota has real headroom again". It does now: the sync
-        path stopped being a single key and waterfalls through the whole account pool, same
-        as the CDN one (see _fetch_raw_via_sync_api). The reason to spare it is gone.
+        Le chemin est desormais unique et lineaire : une requete, un fichier deja decoupe,
+        un reencodage. Tout ce qui l'entourait a disparu avec la cause qui le justifiait.
 
-        The incident that forced it is the other half: youtube-mp3-2025 broke on its own
-        side, and CDN-first meant every scan burned ~150s polling a provider that could not
-        answer before the working path was even tried. Sync is also the faster and more
-        reliable of the two when both are healthy, so this is the right resting state, not a
-        temporary workaround. Only a partial slice of the file is pulled, not the whole track.
+        Le telechargement partiel (PARTIAL_CAP_BYTES) coupait le fichier a 1,5 Mo pour ne
+        pas tirer 4 minutes de son inutiles. Le fournisseur decoupe maintenant lui-meme :
+        le fichier fait 730 Ko et il est entierement utile.
 
-        If the partial file can't be decoded (its M4A moov atom sat past the cut), we
-        re-download the FULL file from whichever provider won and extract from that — so
-        the partial-download optimization can never turn into a failed scan.
+        Le retelechargement complet en cas d'echec d'extraction existait parce qu'une coupe
+        partielle pouvait tomber au mauvais endroit d'un conteneur MP4. Il n'y a plus de
+        coupe partielle, et le reencodage ne depend plus du conteneur : ce repli couteux
+        (210 s de plus pour reproduire le meme echec) n'a plus d'objet.
         """
         video_id = self._extract_video_id(youtube_url)
 
@@ -498,38 +476,23 @@ class YouTubeService:
             logger.error("❌ Could not extract video ID from URL")
             return None
 
-        # Clean up any existing files (all raw variants included)
-        for ext in ('webm', 'm4a', 'mp4', 'mp3', 'wav'):
-            for name in (f'beatlink_{video_id}.{ext}',
-                         f'beatlink_{video_id}_raw.{ext}',
-                         f'beatlink_{video_id}_raw_full.{ext}'):
-                p = os.path.join(self.temp_dir, name)
-                if os.path.exists(p):
-                    os.remove(p)
+        # Un restant d'un scan precedent sur le meme beat serait relu tel quel : on nettoie
+        # les trois noms que ce beat peut produire avant de commencer.
+        for name in (f'beatlink_{video_id}_raw.opus',
+                     f'beatlink_{video_id}.mp3',
+                     f'beatlink_{video_id}.wav'):
+            stale = os.path.join(self.temp_dir, name)
+            if os.path.exists(stale):
+                os.remove(stale)
 
-        raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.m4a')
+        raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw.opus')
 
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
-
-            if not self._fetch_raw_via_sync_api(video_id, raw_path, PARTIAL_CAP_BYTES):
+            if not self._fetch_raw_via_sync_api(video_id, raw_path):
                 logger.error("❌ Audio download failed")
                 return None
-            winner = 'dl'
-
-            m4a_path = self._extract_30s(raw_path, video_id)
-            if m4a_path:
-                return m4a_path
-
-            # Partial slice couldn't be decoded — re-download the FULL file from the winner.
-            logger.warning(f"⚠️ Partial extract failed — re-downloading full file from [{winner}]...")
-            full_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_raw_full.m4a')
-            fetch_fn = self._fetch_raw_via_sync_api
-            if not fetch_fn(video_id, full_path, None):
-                logger.error("❌ Full re-download failed")
-                return None
-            return self._extract_30s(full_path, video_id)
-
+            return self._to_acr_sample(raw_path, video_id)
         except Exception as e:
             logger.error(f"❌ Download error: {str(e)}", exc_info=True)
             return None
