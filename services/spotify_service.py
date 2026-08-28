@@ -654,6 +654,10 @@ class SpotifyService:
                 'isrc': str(data.get('isrc') or '').strip(),
                 'artist_id': str(artist.get('id') or ''),
                 'artist_name': artist.get('name') or '',
+                # False on a track nobody can actually play — usually a takedown. Deezer's
+                # own signal for it, alongside an empty available_countries. The caller
+                # decides what to do with a match nobody can listen to; this just reports it.
+                'readable': bool(data.get('readable', True)),
             }
         except Exception:
             return {}
@@ -763,10 +767,20 @@ class SpotifyService:
                 source, source_url, cover_url = None, '', ''
                 dz = {}
                 if match.get('deezer_id'):
-                    source = 'deezer'
-                    source_url = f"https://www.deezer.com/track/{match['deezer_id']}"
                     dz = self._deezer_track(match['deezer_id'])
-                    cover_url = dz.get('cover_url', '')
+                    if dz.get('readable', True):
+                        source = 'deezer'
+                        source_url = f"https://www.deezer.com/track/{match['deezer_id']}"
+                        cover_url = dz.get('cover_url', '')
+                    else:
+                        # readable: false (with available_countries: []) is Deezer's own
+                        # signal that nobody, anywhere, can play this recording — a taken-down
+                        # track surfaced only as a broken card (no real cover, "Sin Nombre"-
+                        # style title) with no way to actually listen to it. Treated exactly
+                        # like Deezer never matched at all: no source, no cover. The ISRC
+                        # below is still tried — if Spotify separately has the recording, it
+                        # is shown attributed to Spotify instead.
+                        logger.info(f"🚫 Deezer track {match['deezer_id']} for '{match['title']}' is not readable anywhere — ignoring the Deezer match")
                 elif match.get('youtube_vid'):
                     source = 'youtube'
                     source_url = f"https://www.youtube.com/watch?v={match['youtube_vid']}"
