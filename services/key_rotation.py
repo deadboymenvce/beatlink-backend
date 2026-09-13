@@ -66,6 +66,13 @@ class KeyRotator:
         # inherits what the previous process already paid to discover — otherwise the cursor
         # returned to slot 1 on every redeploy and every scan re-opened by burning requests
         # on a key that was already dead. Starting position is the first key NOT in this set.
+        #
+        # fetch_spent_labels is time-aware (added 2026-09-14): a row past its reported quota
+        # reset, or a 403 old enough that the account may have been subscribed since, is left
+        # out of this set so THIS restart gets to retry it — not just the next one. Once
+        # seeded, though, this set only ever grows for the rest of THIS process's life (see
+        # _advance_locked): a key that comes back mid-run (quota resets, a subscription lands)
+        # is only picked up again on the next restart/redeploy, not live.
         self._spent = fetch_spent_labels(api_name)
         if self._spent:
             while self.idx < len(self.accounts) and self.accounts[self.idx][0] in self._spent:

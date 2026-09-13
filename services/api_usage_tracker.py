@@ -6,6 +6,26 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+# How long a 403 ("not subscribed to this API") keeps a key out of rotation before it's
+# worth probing again. Unlike quota exhaustion, there is no clock RapidAPI reports for
+# this — a human can fix the subscription at any moment — so this is a flat cooldown
+# rather than a real deadline. Cheap insurance: at most one wasted 403 every 6h per key
+# instead of that key being blind-skipped forever until someone remembers to clear its
+# row in Supabase by hand.
+_RESUBSCRIBE_RECHECK_S = 6 * 3600
+
+
+def _parse_updated_at(value):
+    """Best-effort parse of a PostgREST timestamp. Returns None on anything unparseable
+    so the caller can fall back to the old, safe "treat as still spent" behaviour rather
+    than silently un-spending a key it can't actually reason about the age of."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
 # Lowest `remaining` already written per (api_name, key_label), and the lock guarding it.
 #
 # The scan enrichment runs 4 responses in parallel and every one of them upserts this table.
@@ -129,15 +149,30 @@ def record_key_unusable(api_name, key_label):
 
 def fetch_spent_labels(api_name, floor=1):
     """Key labels this API has already been told are out of quota, read back from the same
-    table record_api_usage writes to.
+    table record_api_usage writes to — MINUS whichever of those have plausibly become
+    usable again since they were last recorded, so a fixed subscription or a monthly quota
+    reset is picked up on the next restart instead of the key staying blind-skipped forever.
 
     Exists so a fresh process doesn't have to rediscover, one wasted request at a time, what
     the previous one already learned. Without it every container restart sent the rotator
     back to the first key in the list, and if that key was spent, every scan opened by
     burning requests on it before moving on.
 
-    Returns a set of labels. Empty on any failure, which degrades to exactly the old
-    behaviour rather than wrongly retiring a working key.
+    Two different reasons a row can read remaining <= floor, aged differently:
+      * Genuine quota exhaustion (limit_value set, reset_seconds set): RapidAPI itself told
+        us how many seconds were left, as of updated_at. Past that real deadline the quota
+        has almost certainly reset — worth trying again.
+      * "Not subscribed" (limit_value NULL — see record_key_unusable): no clock applies,
+        since a human can fix the subscription at any moment. Re-probed on a flat
+        _RESUBSCRIBE_RECHECK_S cooldown instead of never again.
+
+    Found live 2026-09-14: every pool account except one had been sitting on a Sept-11 403
+    with nothing to ever re-try them, so subscribing a fixed account on RapidAPI's side
+    would otherwise have changed nothing until someone manually cleared its row by hand.
+
+    Returns a set of labels. On any read failure, or for a row whose age can't be
+    determined, degrades to the old "still spent" behaviour rather than wrongly un-spending
+    a key that might still be dead.
     """
     if not _SUPABASE_URL or not _SUPABASE_KEY:
         return set()
@@ -145,13 +180,41 @@ def fetch_spent_labels(api_name, floor=1):
         r = requests.get(
             f"{_SUPABASE_URL}/rest/v1/api_usage_status",
             headers={"apikey": _SUPABASE_KEY, "Authorization": f"Bearer {_SUPABASE_KEY}"},
-            params={"select": "key_label,remaining", "api_name": f"eq.{api_name}",
-                    "remaining": f"lte.{floor}"},
+            params={"select": "key_label,remaining,limit_value,reset_seconds,updated_at",
+                    "api_name": f"eq.{api_name}", "remaining": f"lte.{floor}"},
             timeout=5,
         )
         if r.status_code != 200:
             return set()
-        return {row["key_label"] for row in (r.json() or []) if row.get("key_label")}
+
+        now = datetime.now(timezone.utc)
+        spent = set()
+        for row in (r.json() or []):
+            label = row.get("key_label")
+            if not label:
+                continue
+
+            recorded_at = _parse_updated_at(row.get("updated_at"))
+            if recorded_at is None:
+                spent.add(label)
+                continue
+
+            age_s = (now - recorded_at).total_seconds()
+            limit_value = row.get("limit_value")
+            reset_seconds = row.get("reset_seconds")
+
+            if limit_value is not None and reset_seconds is not None:
+                if age_s >= reset_seconds:
+                    logger.info(f"⏰ {api_name}: '{label}' recorded reset window has passed "
+                                f"({int(age_s)}s ≥ {reset_seconds}s) — retrying it")
+                    continue
+            elif age_s >= _RESUBSCRIBE_RECHECK_S:
+                logger.info(f"⏰ {api_name}: '{label}' was not subscribed {int(age_s)}s ago — "
+                            f"re-checking in case that changed")
+                continue
+
+            spent.add(label)
+        return spent
     except Exception as e:
         logger.warning(f"⚠️ could not read spent keys for {api_name}: {e}")
         return set()
