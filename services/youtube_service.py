@@ -313,12 +313,16 @@ class YouTubeService:
                f"&trim_duration={TRIM_DURATION_S}")
 
         # ── 1. Le lien : une seule requete RapidAPI par beat ─────────────────
-        while True:
-            label, key = self.sync_key_rotator.current()
-            if key is None:
-                logger.error("❌ [dl] No usable RapidAPI account left")
-                return False
-
+        #
+        # Boucle sur usable_accounts() plutot que sur current() seul : un timeout ou une
+        # erreur reseau ne dit rien du quota du compte (voir la docstring de
+        # usable_accounts), donc il ne doit ni le marquer "spent" ni arreter le
+        # telechargement — juste faire essayer un compte voisin. C'est exactement le trou
+        # qui a fait echouer tous les scans le 19/09 : un seul timeout de 120 s sur le
+        # premier compte terminait le telechargement (return False immediat), sans jamais
+        # essayer les 6 autres comptes du pool alors qu'ils etaient disponibles.
+        r = None
+        for label, key in self.sync_key_rotator.usable_accounts():
             headers = {
                 'Content-Type': 'application/json',
                 'x-rapidapi-host': self.rapidapi_sync_host,
@@ -328,24 +332,27 @@ class YouTubeService:
                 logger.info(f"🚀 [dl] Requesting download link: id={video_id} (account: {label})")
                 # 120 s de lecture et non 60 : l'endpoint fabrique le fragment AVANT de
                 # repondre, il bloque donc ~18 s, parfois plus sur une longue video.
-                r = requests.get(url, headers=headers, timeout=(10, 120))
+                resp = requests.get(url, headers=headers, timeout=(10, 120))
             except requests.exceptions.RequestException as e:
-                logger.warning(f"⚠️ [dl] Request failed: {e}")
-                return False
+                logger.warning(f"⚠️ [dl] Request failed on '{label}': {e} — trying next account")
+                continue
 
-            switched = self.sync_key_rotator.note_response(r.headers, used_label=label)
+            switched = self.sync_key_rotator.note_response(resp.headers, used_label=label)
 
-            if r.status_code in (403, 429):
-                logger.warning(f"⚠️ [dl] {r.status_code} on '{label}': {r.text[:160]}")
+            if resp.status_code in (403, 429):
+                logger.warning(f"⚠️ [dl] {resp.status_code} on '{label}': {resp.text[:160]}")
                 if not switched:
-                    reason = ('is not subscribed to this API' if r.status_code == 403
+                    reason = ('is not subscribed to this API' if resp.status_code == 403
                               else 'is out of monthly quota')
-                    switched = self.sync_key_rotator.mark_unusable(label, reason)
-                if switched:
-                    continue
-                logger.error("❌ [dl] Every configured account is spent")
-                return False
+                    self.sync_key_rotator.mark_unusable(label, reason)
+                continue
+
+            r = resp
             break
+
+        if r is None:
+            logger.error("❌ [dl] Every usable RapidAPI account failed or is spent")
+            return False
 
         if r.status_code != 200:
             logger.warning(f"⚠️ [dl] Non-200: {r.status_code} - {r.text[:200]}")
