@@ -450,11 +450,11 @@ def scan_queue():
 
 @app.route('/admin/probe-usage', methods=['POST'])
 def probe_usage():
-    """On-demand: sends one real request per configured RapidAPI key (both the Spotify
-    scraper and the YouTube downloader), reads back RapidAPI's own rate-limit headers, and
-    writes them to api_usage_status — see services/usage_probe.py for why this exists and
-    what it costs. Never called automatically; the /settings admin panel's "Check now"
-    button is the only caller.
+    """On-demand: sends one real request for ONE configured RapidAPI key (api_name + label
+    in the JSON body), reads back RapidAPI's own rate-limit headers, and writes them to
+    api_usage_status — see services/usage_probe.py for why this exists and what it costs.
+    Never called automatically; the /settings admin panel's per-key "Check" buttons are the
+    only caller, one request per click.
 
     Gated on a shared secret rather than left open: unlike every other route here, this one
     spends real money-metered quota on every call, so it can't be left for anyone to hit.
@@ -469,9 +469,16 @@ def probe_usage():
     if request.headers.get('X-Admin-Secret') != admin_secret:
         return jsonify({'success': False, 'error': 'unauthorized'}), 401
 
-    from services.usage_probe import probe_all_accounts
-    results = probe_all_accounts()
-    return jsonify({'success': True, 'results': results}), 200
+    data = request.get_json(silent=True) or {}
+    api_name = data.get('api_name')
+    label = data.get('label')
+    if not api_name or not label:
+        return jsonify({'success': False, 'error': 'missing_params',
+                         'message': 'api_name and label are both required'}), 400
+
+    from services.usage_probe import probe_one_account
+    result = probe_one_account(api_name, label)
+    return jsonify({'success': True, 'result': result}), 200
 
 
 @app.route('/youtube/search', methods=['GET'])

@@ -1,16 +1,10 @@
 import os
 import logging
-from concurrent.futures import ThreadPoolExecutor
 import requests
 from services.key_rotation import POOL_ACCOUNTS
 from services.api_usage_tracker import record_api_usage, record_key_unusable
 
 logger = logging.getLogger(__name__)
-
-# Same bounded-concurrency reasoning as spotify_service's own enrichment pool: enough
-# workers to not wait out 8 accounts one at a time, not so many that the host sees a burst
-# and starts throttling by IP on top of the per-key limits it already enforces.
-PROBE_MAX_WORKERS = 4
 
 # RapidAPI has no free "check my quota" call — the only way to read the X-RateLimit-*
 # headers for a key is to make a real request with it. Both targets below are picked to be
@@ -29,6 +23,26 @@ _YOUTUBE_HOST = "youtube-video-fast-downloader-24-7.p.rapidapi.com"
 _YOUTUBE_PROBE_VIDEO_ID = "jNQXAC9IVRw"
 _YOUTUBE_PROBE_PARAMS = "quality=251&trim_start_time=0&trim_duration=1"
 
+# One entry per multi-key API this panel tracks. `timeout` is a (connect, read) pair —
+# the YouTube downloader genuinely does real work server-side (fetch + re-encode) before
+# answering, unlike Spotify's lightweight lookup, so it gets a much longer read window.
+_API_CONFIG = {
+    'real-time-spotify-data-scraper': {
+        'primary_label': 'Primary',
+        'primary_env_var': 'RAPIDAPI_KEY_SPOTIFY',
+        'host': _SPOTIFY_HOST,
+        'url': f"https://{_SPOTIFY_HOST}/artist_overview/?id={_SPOTIFY_PROBE_ARTIST_ID}",
+        'timeout': (10, 15),
+    },
+    'youtube-video-fast-downloader-24-7': {
+        'primary_label': 'prodconnect512@gmail.com',
+        'primary_env_var': 'RAPIDAPI_KEY',
+        'host': _YOUTUBE_HOST,
+        'url': f"https://{_YOUTUBE_HOST}/download_audio/{_YOUTUBE_PROBE_VIDEO_ID}?{_YOUTUBE_PROBE_PARAMS}",
+        'timeout': (10, 90),
+    },
+}
+
 
 def _configured_accounts(primary_label, primary_env_var):
     accounts = [(primary_label, os.getenv(primary_env_var))] + [
@@ -37,13 +51,33 @@ def _configured_accounts(primary_label, primary_env_var):
     return [(label, key) for label, key in accounts if key]
 
 
-def _probe_one(api_name, host, url, label, key, timeout):
+def probe_one_account(api_name, label):
+    """Sends exactly one real request for exactly one (api_name, label) key, reads
+    RapidAPI's own rate-limit headers off the response, and writes them to
+    api_usage_status via the same record_api_usage() a real scan uses.
+
+    One key at a time, on purpose (see /settings' per-key "Check" buttons): probing all 8
+    accounts together meant a slow key at the back of the batch (the YouTube downloader
+    genuinely takes real time per call) could still be running when the admin only wanted
+    to re-check the one key they knew was stale, burning time and quota on keys that were
+    already known-good.
+    """
+    cfg = _API_CONFIG.get(api_name)
+    if not cfg:
+        return {'label': label, 'ok': False, 'error': f'unknown api_name: {api_name}'}
+
+    accounts = dict(_configured_accounts(cfg['primary_label'], cfg['primary_env_var']))
+    key = accounts.get(label)
+    if not key:
+        return {'label': label, 'ok': False, 'error': 'this key has no env var configured on this service'}
+
     try:
-        resp = requests.get(url, headers={
-            'x-rapidapi-host': host,
+        resp = requests.get(cfg['url'], headers={
+            'x-rapidapi-host': cfg['host'],
             'x-rapidapi-key': key,
-        }, timeout=timeout)
+        }, timeout=cfg['timeout'])
     except requests.exceptions.RequestException as e:
+        logger.warning(f"⚠️ probe_one_account: {api_name} '{label}' request failed: {e}")
         return {'label': label, 'ok': False, 'error': str(e)}
 
     if resp.status_code == 403:
@@ -62,39 +96,3 @@ def _probe_one(api_name, host, url, label, key, timeout):
         'remaining': resp.headers.get('X-RateLimit-Requests-Remaining'),
         'reset_seconds': resp.headers.get('X-RateLimit-Requests-Reset'),
     }
-
-
-def probe_all_accounts():
-    """Sends exactly one real request per configured RapidAPI key, for both the Spotify
-    scraper and the YouTube downloader, and writes each response's rate-limit headers
-    straight to api_usage_status via the same record_api_usage() a real scan uses — so the
-    /settings admin panel reflects every key's true current state immediately, instead of
-    only whichever key the most recent real scan happened to touch.
-
-    Costs exactly one real request per configured key, against each key's real monthly
-    quota. This is an on-demand admin action (POST /admin/probe-usage), never something to
-    run on a timer — see api_usage_tracker.py's own comment on why this project doesn't
-    poll RapidAPI for usage by default.
-    """
-    results = {}
-
-    spotify_accounts = _configured_accounts('Primary', 'RAPIDAPI_KEY_SPOTIFY')
-    spotify_url = f"https://{_SPOTIFY_HOST}/artist_overview/?id={_SPOTIFY_PROBE_ARTIST_ID}"
-    with ThreadPoolExecutor(max_workers=PROBE_MAX_WORKERS) as ex:
-        results['real-time-spotify-data-scraper'] = list(ex.map(
-            lambda acc: _probe_one('real-time-spotify-data-scraper', _SPOTIFY_HOST, spotify_url, acc[0], acc[1], (10, 15)),
-            spotify_accounts,
-        ))
-
-    youtube_accounts = _configured_accounts('prodconnect512@gmail.com', 'RAPIDAPI_KEY')
-    youtube_url = f"https://{_YOUTUBE_HOST}/download_audio/{_YOUTUBE_PROBE_VIDEO_ID}?{_YOUTUBE_PROBE_PARAMS}"
-    with ThreadPoolExecutor(max_workers=PROBE_MAX_WORKERS) as ex:
-        results['youtube-video-fast-downloader-24-7'] = list(ex.map(
-            lambda acc: _probe_one('youtube-video-fast-downloader-24-7', _YOUTUBE_HOST, youtube_url, acc[0], acc[1], (10, 60)),
-            youtube_accounts,
-        ))
-
-    if not spotify_accounts and not youtube_accounts:
-        logger.warning("⚠️ probe_all_accounts: no keys configured for either API")
-
-    return results
