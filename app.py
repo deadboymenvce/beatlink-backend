@@ -448,6 +448,32 @@ def scan_queue():
     }), 200
 
 
+@app.route('/admin/probe-usage', methods=['POST'])
+def probe_usage():
+    """On-demand: sends one real request per configured RapidAPI key (both the Spotify
+    scraper and the YouTube downloader), reads back RapidAPI's own rate-limit headers, and
+    writes them to api_usage_status — see services/usage_probe.py for why this exists and
+    what it costs. Never called automatically; the /settings admin panel's "Check now"
+    button is the only caller.
+
+    Gated on a shared secret rather than left open: unlike every other route here, this one
+    spends real money-metered quota on every call, so it can't be left for anyone to hit.
+    Fails closed (503) if ADMIN_API_SECRET isn't set on this service at all, rather than
+    silently accepting every request once the header check would otherwise have nothing to
+    compare against.
+    """
+    admin_secret = os.getenv('ADMIN_API_SECRET')
+    if not admin_secret:
+        return jsonify({'success': False, 'error': 'not_configured',
+                         'message': 'ADMIN_API_SECRET is not set on this service'}), 503
+    if request.headers.get('X-Admin-Secret') != admin_secret:
+        return jsonify({'success': False, 'error': 'unauthorized'}), 401
+
+    from services.usage_probe import probe_all_accounts
+    results = probe_all_accounts()
+    return jsonify({'success': True, 'results': results}), 200
+
+
 @app.route('/youtube/search', methods=['GET'])
 def youtube_search():
     """Most-watched "{niche} type beat" videos, for the scanner's auto-suggestions.
