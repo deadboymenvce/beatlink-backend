@@ -102,14 +102,18 @@ def _prune_old_jobs():
 ALT_SOURCE_PLANS = None  # None = every plan; a set would restrict to those plans
 
 
-def execute_scan(youtube_url, scan_id, plan=None):
+def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
     """The actual pipeline — unchanged from the old inline /scan handler, just
     extracted so it can be called from a worker thread instead of the request
     thread. Returns the same response body /scan always returned on success,
     or raises on a hard failure (caught by the worker loop).
 
     `plan` is the caller's current plan, used only to decide whether non-Spotify
-    matches are included (see ALT_SOURCE_PLANS)."""
+    matches are included (see ALT_SOURCE_PLANS). `min_monthly_listeners` is the
+    producer's own configured floor — see enrich_tracks for how it's used to skip
+    an avoidable RapidAPI call, and qualifies() below for how it also drops
+    below-floor rows from the result itself (previously only the hardcoded 10-
+    listener floor did that)."""
     scan_log = ScanLogger(scan_id, youtube_url)
     try:
         scan_log.log('received', f'Scan requested for {youtube_url}', data={'scan_id': scan_id})
@@ -170,7 +174,7 @@ def execute_scan(youtube_url, scan_id, plan=None):
         })
 
         logger.info("🎵 Step 4: Enriching with Spotify metadata...")
-        enriched_songs = spotify_service.enrich_tracks(matches)
+        enriched_songs = spotify_service.enrich_tracks(matches, min_monthly_listeners)
 
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
         scan_log.log('spotify', f'Enriched {len(enriched_songs)} song(s) with Spotify data', data={'count': len(enriched_songs)})
@@ -307,9 +311,10 @@ def _run_job(job_id):
             job['started_at'] = time.time()
             youtube_url, scan_id = job['youtube_url'], job['scan_id']
             plan = job.get('plan')
+            min_monthly_listeners = job.get('min_monthly_listeners', 0)
 
         try:
-            result = execute_scan(youtube_url, scan_id, plan)
+            result = execute_scan(youtube_url, scan_id, plan, min_monthly_listeners)
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job is not None:
@@ -352,7 +357,8 @@ def scan_beat():
     {
         "youtube_url": "https://www.youtube.com/watch?v=...",
         "scan_id": "optional, correlates scan_logs rows",
-        "plan": "optional, e.g. 'ultimate'/'pro'/'starter'/'free' — determines queue priority"
+        "plan": "optional, e.g. 'ultimate'/'pro'/'starter'/'free' — determines queue priority",
+        "min_monthly_listeners": "optional int, the producer's own configured floor"
     }
 
     Returns (202):
@@ -362,6 +368,10 @@ def scan_beat():
     youtube_url = data.get('youtube_url')
     scan_id = data.get('scan_id')
     plan = data.get('plan')
+    try:
+        min_monthly_listeners = int(data.get('min_monthly_listeners') or 0)
+    except (TypeError, ValueError):
+        min_monthly_listeners = 0
 
     if not youtube_url:
         return jsonify({
@@ -382,6 +392,10 @@ def scan_beat():
             # matches are returned (see ALT_SOURCE_PLANS). Previously read off the request
             # and then dropped, since queue priority was the only thing it fed.
             'plan': plan,
+            # The producer's own configured floor — see enrich_tracks for how it skips an
+            # avoidable RapidAPI call instead of running it for an artist the frontend is
+            # going to filter out anyway.
+            'min_monthly_listeners': min_monthly_listeners,
             'created_at': time.time(),
             'started_at': None,
             'finished_at': None,

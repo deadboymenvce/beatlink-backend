@@ -536,7 +536,7 @@ class SpotifyService:
 
         return out
 
-    def _get_artist_data_with_cache(self, artist_id, artist_name=None):
+    def _get_artist_data_with_cache(self, artist_id, artist_name=None, min_monthly_listeners=0):
         """
         Get artist data with 24h cache
         
@@ -594,8 +594,13 @@ class SpotifyService:
         # poorly-differentiated names), so we skip it entirely rather than hand back a
         # probably-wrong contact. Flagged instagram_via_google since this source is the
         # least reliable (the frontend uses the flag to gate reporting).
+        # Also raised to the producer's own configured floor: app.py's qualifies() drops
+        # every artist under it anyway (unless a contact is found), so searching Google for
+        # one that's already going to be discarded is a request for nothing — this is a
+        # distinct quota (google-search116) from the artist_overview call above it.
+        instagram_search_floor = max(15, min_monthly_listeners or 0)
         if (not data.get('instagram_url') and artist_name
-                and data.get('_rapidapi_ok') and (data.get('listeners') or 0) >= 15):
+                and data.get('_rapidapi_ok') and (data.get('listeners') or 0) >= instagram_search_floor):
             google_result = self._search_instagram_google(artist_name)
             if google_result.get('instagram_url'):
                 data['instagram_url'] = google_result['instagram_url']
@@ -726,14 +731,18 @@ class SpotifyService:
             logger.warning(f"⚠️ ISRC lookup failed for {isrc}: {e}")
             return {}
 
-    def enrich_tracks(self, matches):
+    def enrich_tracks(self, matches, min_monthly_listeners=0):
         """
         Enrich ACR Cloud matches with Spotify metadata + RapidAPI artist data
-        
+
         Args:
             matches: List of ACR Cloud matches (pre-processed format)
                      Each match has: spotify_id, title, artists, score
-        
+            min_monthly_listeners: the producer's own configured floor, used only to
+                     raise the Instagram Google-search fallback's threshold (see
+                     _get_artist_data_with_cache) — never skips the artist_overview
+                     RapidAPI call itself, since listeners is that call's own output.
+
         Returns:
             List of enriched tracks with complete metadata
         """
@@ -911,7 +920,7 @@ class SpotifyService:
 
             with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as ex:
                 scraped_list = list(ex.map(
-                    lambda pair: self._get_artist_data_with_cache(pair[0], pair[1]),
+                    lambda pair: self._get_artist_data_with_cache(pair[0], pair[1], min_monthly_listeners),
                     unique_pairs
                 ))
             scraped_by_id = {pair[0]: data for pair, data in zip(unique_pairs, scraped_list)}
