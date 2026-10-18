@@ -179,46 +179,15 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
         logger.info(f"✅ Enriched {len(enriched_songs)} songs with Spotify data")
         scan_log.log('spotify', f'Enriched {len(enriched_songs)} song(s) with Spotify data', data={'count': len(enriched_songs)})
 
-        # A row qualifies either as a full Spotify result (unchanged rules: artist page
-        # resolved, cover art, and a real discography behind it), or — for the plans allowed
-        # alt sources — as a match that only a non-Spotify database could name. The
-        # ghost-artist rule is Spotify-only on purpose: has_discography is derived from the
-        # Spotify artist page, so a Deezer/YouTube row has nothing to be judged on and would
-        # be dropped for failing a test that was never run against it.
         allow_alt = ALT_SOURCE_PLANS is None or (plan or '') in ALT_SOURCE_PLANS
 
-        def qualifies(song):
-            if song.get('spotify_url'):
-                base = bool(song.get('cover_url')) and song.get('has_discography', True)
-            else:
-                # Alt-source rows carry has_discography too now: from the Spotify artist page when
-                # the ISRC resolved, or from Deezer's own album count when it did not. A 0-release
-                # ghost is therefore filtered on either platform, not just on Spotify.
-                base = allow_alt and bool(song.get('source')) and song.get('has_discography', True)
-            # No audience/contact test here any more (2026-10-19): a tiny artist with no way
-            # to reach them is kept, and shown as "Theft suspected" (low_signal, set in
-            # spotify_service for a confirmed sub-100 artist with no contact) instead of
-            # being silently thrown away.
-            return bool(base)
-
-        filtered_songs = [song for song in enriched_songs if qualifies(song)]
-
+        # Nothing is dropped any more (2026-10-19): every artist ACRCloud named comes back,
+        # whatever its audience, cover, discography or platform link. A tiny artist with no
+        # contact is shown as "Theft suspected" (low_signal, set in spotify_service); the site
+        # decides what is above the producer's floor. The only rows ACRCloud itself never
+        # hands over are the ones scored under 40, untitled, or with no artist name.
+        filtered_songs = list(enriched_songs)
         dropped = []
-        for song in enriched_songs:
-            if qualifies(song):
-                continue
-            reasons = []
-            if not song.get('spotify_url'):
-                if not song.get('source'):
-                    reasons.append('no platform link at all')
-                elif not allow_alt:
-                    reasons.append(f"{song.get('source')}-only (alt sources not enabled for this plan)")
-            else:
-                if not song.get('cover_url'):
-                    reasons.append('no cover')
-                if not song.get('has_discography', True):
-                    reasons.append('ghost artist (0 published tracks)')
-            dropped.append({'name': song.get('artists') or song.get('title'), 'reasons': reasons or ['unqualified']})
 
         # Provenance breakdown, so the effect of enabling Deezer/YouTube Music is measurable
         # from the scan logs instead of inferred.
