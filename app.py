@@ -187,24 +187,6 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
         # be dropped for failing a test that was never run against it.
         allow_alt = ALT_SOURCE_PLANS is None or (plan or '') in ALT_SOURCE_PLANS
 
-        def has_real_contact(song):
-            # "Real" = linked straight from the artist's Spotify profile or declared in their
-            # own bio — excludes an instagram_url found via the last-resort Google name search
-            # (instagram_via_google), which is a guess, not a confirmed contact. tiktok_url,
-            # twitter_url and email never carry that flag: they only ever come from a linked
-            # profile or the bio parse, never from a search.
-            return bool(
-                (song.get('instagram_url') and not song.get('instagram_via_google'))
-                or song.get('tiktok_url') or song.get('twitter_url') or song.get('email')
-            )
-
-        def below_audience_floor(song):
-            # Gated on _rapidapi_ok: that flag is only set once the artist lookup actually
-            # ran and returned data, so a failed/never-attempted lookup reads as "listener
-            # count unknown" (never dropped by this rule) rather than "confirmed tiny" —
-            # same guard low_signal already relies on, a few lines below in spotify_service.py.
-            return bool(song.get('_rapidapi_ok')) and (song.get('listeners') or 0) < 10
-
         def qualifies(song):
             if song.get('spotify_url'):
                 base = bool(song.get('cover_url')) and song.get('has_discography', True)
@@ -213,15 +195,11 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
                 # the ISRC resolved, or from Deezer's own album count when it did not. A 0-release
                 # ghost is therefore filtered on either platform, not just on Spotify.
                 base = allow_alt and bool(song.get('source')) and song.get('has_discography', True)
-            if not base:
-                return False
-            # Under 10 confirmed monthly listeners, only keep the row if there is an actual
-            # way to reach the artist — otherwise it is a dead end cluttering results for no
-            # reason. A real sample of matched_songs showed 43% of all results under this
-            # threshold, 84% of THOSE with no contact anywhere at all (2026-08-28).
-            if below_audience_floor(song) and not has_real_contact(song):
-                return False
-            return True
+            # No audience/contact test here any more (2026-10-19): a tiny artist with no way
+            # to reach them is kept, and shown as "Theft suspected" (low_signal, set in
+            # spotify_service for a confirmed sub-100 artist with no contact) instead of
+            # being silently thrown away.
+            return bool(base)
 
         filtered_songs = [song for song in enriched_songs if qualifies(song)]
 
@@ -240,8 +218,6 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
                     reasons.append('no cover')
                 if not song.get('has_discography', True):
                     reasons.append('ghost artist (0 published tracks)')
-            if below_audience_floor(song) and not has_real_contact(song):
-                reasons.append(f"under 10 monthly listeners ({song.get('listeners') or 0}) with no reachable contact")
             dropped.append({'name': song.get('artists') or song.get('title'), 'reasons': reasons or ['unqualified']})
 
         # Provenance breakdown, so the effect of enabling Deezer/YouTube Music is measurable
