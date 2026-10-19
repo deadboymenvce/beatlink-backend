@@ -145,20 +145,25 @@ def _dedupe_matches(matches):
     return [best[k] for k in order]
 
 
-def _artist_key(song):
-    return song.get('spotify_author_ID') or (song.get('artists') or '').strip().lower() or _track_key(song)
+def _name_key(song):
+    return (song.get('artists') or '').strip().lower()
 
 
 def _dedupe_artists(songs):
     """An artist is returned once, whatever the number of their tracks found on the beat or of
-    the windows that found them. The row with a photo, then a platform link, then the best
-    ACRCloud score is kept."""
+    the windows that found them. A row whose Spotify artist could not be resolved joins the
+    group of a resolved row carrying the same name (the same recording reached through two
+    platforms). The row with a photo, then a platform link, then the best ACRCloud score is kept."""
     def rank(s):
         return (bool(s.get('artist_image') or s.get('cover_url')), bool(s.get('spotify_url')), s.get('score') or 0)
+    id_by_name = {}
+    for s in songs:
+        if s.get('spotify_author_ID'):
+            id_by_name.setdefault(_name_key(s), s['spotify_author_ID'])
     best = {}
     order = []
     for s in songs:
-        k = _artist_key(s)
+        k = s.get('spotify_author_ID') or id_by_name.get(_name_key(s)) or _name_key(s) or _track_key(s)
         if k not in best:
             best[k] = s
             order.append(k)
