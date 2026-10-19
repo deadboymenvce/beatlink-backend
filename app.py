@@ -11,7 +11,6 @@ from services.acrcloud_service import ACRCloudService
 from services.spotify_service import SpotifyService
 from services.brave_search_service import BraveSearchService
 from services.scan_logger import ScanLogger
-from services.beat_cache import fetch_beat_cache, store_beat_cache
 from services import prefetch
 
 # Configure logging
@@ -108,8 +107,6 @@ ALT_SOURCE_PLANS = None  # None = every plan; a set would restrict to those plan
 # ACRCloud answers at most 10 matches per request, so a beat that fills a window has more
 # artists than that window shows. Each later window is cut from the SAME download.
 SEGMENT_STARTS_S = (30, 80, 130)   # where each 30 s sample starts, in seconds
-SUSPECT_VIEWS = 100000             # a beat this popular...
-SUSPECT_MAX_RESULTS = 2            # ...with this few results is not kept in the beat cache
 
 
 def _after_first_window(first_count, low_potential):
@@ -173,7 +170,7 @@ def _dedupe_artists(songs):
 
 
 def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_start=None, segments=1,
-                 low_potential=False, fresh=False, acr_compare=None):
+                 low_potential=False, acr_compare=None):
     """The actual pipeline — unchanged from the old inline /scan handler, just
     extracted so it can be called from a worker thread instead of the request
     thread. Returns the same response body /scan always returned on success,
@@ -191,34 +188,6 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_
 
         n_segments = max(1, min(len(SEGMENT_STARTS_S), int(segments or 1)))
         video_id = youtube_service._extract_video_id(youtube_url)
-        # A beat scanned recently (by anyone) is answered from the cache: no download, no
-        # ACRCloud request, no enrichment. Bypassed by `fresh` and by the test parameters.
-        use_cache = bool(video_id) and not fresh and trim_start is None and not acr_compare
-        if use_cache:
-            hit = fetch_beat_cache(video_id, n_segments)
-            if hit:
-                cached_result = dict(hit['payload'])
-                cached_result['cached'] = True
-                cached_result['cached_at'] = hit['cached_at']
-                scan_log.log('cache', f"Served from the beat cache ({len(cached_result.get('matched_songs') or [])} artist(s), stored {hit['cached_at']})",
-                             data={'cached_at': hit['cached_at'], 'count': len(cached_result.get('matched_songs') or [])})
-                scan_log.log('result', f"Scan complete — {len(cached_result.get('matched_songs') or [])} buyer(s) returned (cache)",
-                             data={'results_count': len(cached_result.get('matched_songs') or [])})
-                return cached_result
-
-        def _remember(result, empty, windows):
-            """Keep this result for the next producer, unless an ACRCloud call failed (it would
-            freeze a partial answer). Off the scan's critical path."""
-            if not use_cache or any(r['status'] == 'error' for r in seg_report):
-                return
-            # A popular beat that comes back with almost nothing is more likely a bad sample than a
-            # beat nobody used (the same video has answered 1 and 10 on different runs): not kept,
-            # so the next producer's scan gets a fresh look instead of the same poor answer.
-            if (video_info.get('views') or 0) >= SUSPECT_VIEWS and len(result.get('matched_songs') or []) <= SUSPECT_MAX_RESULTS:
-                return
-            import threading
-            threading.Thread(target=store_beat_cache, args=(video_id, result, windows, empty), daemon=True).start()
-
         logger.info("⬇️ Step 1: Getting video metadata...")
         video_info = youtube_service.get_video_info(youtube_url)
 
@@ -238,22 +207,22 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_
         seg_files = None
         t_dl = time.time()
         prefetched = False
-        if n_segments > 1 and trim_start is None:
+        if trim_start is None and video_id:
+            # The producer analysed this beat a moment ago: its samples are already here, or their
+            # download is under way and this scan joins it.
+            seg_files, waited = prefetch.take(video_id, n_segments)
+            prefetched = bool(seg_files)
+            if prefetched:
+                scan_log.log('prefetch', f'Prefetched sample(s) used (waited {waited}s)', data={'waited': waited})
+        if not seg_files and n_segments > 1 and trim_start is None:
+            t_dl = time.time()
             seg_files = youtube_service.download_segments(youtube_url, list(SEGMENT_STARTS_S[:n_segments]))
             if not seg_files:
                 scan_log.warn('download', f'Segment download failed after {round(time.time() - t_dl, 1)}s, falling back to one sample')
         audio_path = None
         if not seg_files:
             t_dl = time.time()
-            if n_segments == 1 and trim_start is None and video_id:
-                # The producer analysed this beat a moment ago: its sample is already here, or
-                # its download is under way and this scan joins it.
-                audio_path, waited = prefetch.take(video_id)
-                prefetched = bool(audio_path)
-                if prefetched:
-                    scan_log.log('prefetch', f'Prefetched sample used (waited {waited}s)', data={'waited': waited})
-            if not audio_path:
-                audio_path = youtube_service.download_audio(youtube_url, trim_start)
+            audio_path = youtube_service.download_audio(youtube_url, trim_start)
             if not audio_path:
                 scan_log.error('download', 'Audio download failed (no file returned)')
                 return {
@@ -319,7 +288,6 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_
                                                  'artists': sorted({(m.get('artists') or '').lower() for m in res['matches']})}
             youtube_service.cleanup_audio(audio_path)
         acr_secs = round(time.time() - t_acr, 1)
-        windows_done = n_segments if seg_files else 1
 
         if not matches:
             logger.info("ℹ️ No matches found in ACR Cloud")
@@ -336,7 +304,6 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_
                 'matched_songs': [],
                 'results_count': 0,
             }
-            _remember(empty_result, True, windows_done)
             if compare_report is not None:
                 empty_result['acr_compare'] = compare_report
             return empty_result
@@ -406,7 +373,6 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_
             'matched_songs': filtered_songs,
             'results_count': len(filtered_songs),
         }
-        _remember(final_result, False, windows_done)
         if compare_report is not None:
             final_result['acr_compare'] = compare_report
         return final_result
@@ -444,7 +410,7 @@ def _run_job(job_id):
 
         try:
             result = execute_scan(youtube_url, scan_id, plan, min_monthly_listeners, job.get('trim_start'), job.get('segments', 1),
-                                  low_potential=bool(job.get('low_potential')), fresh=bool(job.get('fresh')),
+                                  low_potential=bool(job.get('low_potential')),
                                   acr_compare=job.get('acr_compare'))
             with _jobs_lock:
                 job = _jobs.get(job_id)
@@ -482,15 +448,19 @@ def health():
 def prefetch_audio():
     """Start downloading a beat's sample in the background, so a scan asked for a moment later
     finds it ready. Called by the site when a producer analyses a beat worth scanning.
-    Returns immediately: {'success': true, 'status': 'started' | 'already' | 'capped' | 'cached'}."""
+    Returns immediately: {'success': true, 'status': 'started' | 'already' | 'capped'}.
+    `segments` is how many windows the scan that follows will use (the site sends the same number)."""
     data = request.get_json(silent=True) or {}
     youtube_url = data.get('youtube_url')
     video_id = youtube_service._extract_video_id(youtube_url) if youtube_url else None
     if not video_id:
         return jsonify({'success': False, 'error': 'missing_url'}), 400
-    if fetch_beat_cache(video_id, 1):
-        return jsonify({'success': True, 'status': 'cached'}), 200
-    return jsonify({'success': True, 'status': prefetch.start(video_id, youtube_url, youtube_service)}), 202
+    try:
+        windows = max(1, min(len(SEGMENT_STARTS_S), int(data.get('segments') or 1)))
+    except (TypeError, ValueError):
+        windows = 1
+    return jsonify({'success': True, 'status': prefetch.start(video_id, youtube_url, youtube_service,
+                                                              list(SEGMENT_STARTS_S[:windows]))}), 202
 
 
 @app.route('/scan', methods=['POST'])
@@ -520,9 +490,8 @@ def scan_beat():
         min_monthly_listeners = 0
 
     # Optional, sent by the site: the beat is low-potential (same score as its warning popup),
-    # `fresh` skips the beat cache, `acr_compare` (test only) lists sample parts to compare.
+    # `acr_compare` (test only) lists sample parts to compare.
     low_potential = bool(data.get('low_potential'))
-    fresh = bool(data.get('fresh'))
     acr_compare = data.get('acr_compare') if isinstance(data.get('acr_compare'), list) else None
 
     # Optional: how many 30 s samples of the beat to send to ACRCloud (1 = today's behaviour,
@@ -566,7 +535,6 @@ def scan_beat():
             'trim_start': trim_start,
             'segments': segments,
             'low_potential': low_potential,
-            'fresh': fresh,
             'acr_compare': acr_compare,
             'created_at': time.time(),
             'started_at': None,
