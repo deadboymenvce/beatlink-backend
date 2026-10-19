@@ -290,7 +290,7 @@ class YouTubeService:
                 'message': f'Error: {str(e)}'
             }
 
-    def _fetch_raw_via_sync_api(self, video_id, raw_path):
+    def _fetch_raw_via_sync_api(self, video_id, raw_path, trim_start=None):
         """Une requete RapidAPI, puis le fichier deja decoupe a 30 secondes.
 
         GET /download_audio/{id}?quality=251&trim_start_time=30&trim_duration=30 bloque
@@ -309,7 +309,7 @@ class YouTubeService:
         et l'un peut le publier avant l'autre.
         """
         url = (f"https://{self.rapidapi_sync_host}/download_audio/{video_id}"
-               f"?quality={AUDIO_QUALITY}&trim_start_time={TRIM_START_S}"
+               f"?quality={AUDIO_QUALITY}&trim_start_time={TRIM_START_S if trim_start is None else trim_start}"
                f"&trim_duration={TRIM_DURATION_S}")
 
         # ── 1. Le lien : une seule requete RapidAPI par beat ─────────────────
@@ -462,7 +462,7 @@ class YouTubeService:
         logger.error("❌ Could not produce an ACR sample in any format")
         return None
 
-    def download_audio(self, youtube_url):
+    def download_audio(self, youtube_url, trim_start=None):
         """Rend un echantillon de 30 secondes pour ACRCloud, ou None.
 
         Le chemin est desormais unique et lineaire : une requete, un fichier deja decoupe,
@@ -496,7 +496,7 @@ class YouTubeService:
 
         try:
             logger.info(f"🎵 Downloading audio for {video_id}...")
-            if not self._fetch_raw_via_sync_api(video_id, raw_path):
+            if not self._fetch_raw_via_sync_api(video_id, raw_path, trim_start):
                 logger.error("❌ Audio download failed")
                 return None
             return self._to_acr_sample(raw_path, video_id)

@@ -102,7 +102,7 @@ def _prune_old_jobs():
 ALT_SOURCE_PLANS = None  # None = every plan; a set would restrict to those plans
 
 
-def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
+def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_start=None):
     """The actual pipeline — unchanged from the old inline /scan handler, just
     extracted so it can be called from a worker thread instead of the request
     thread. Returns the same response body /scan always returned on success,
@@ -134,7 +134,7 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0):
         })
 
         logger.info("🎵 Step 2: Downloading audio via Apify...")
-        audio_path = youtube_service.download_audio(youtube_url)
+        audio_path = youtube_service.download_audio(youtube_url, trim_start)
 
         if not audio_path:
             scan_log.error('download', 'Audio download failed (no file returned)')
@@ -259,7 +259,7 @@ def _run_job(job_id):
             min_monthly_listeners = job.get('min_monthly_listeners', 0)
 
         try:
-            result = execute_scan(youtube_url, scan_id, plan, min_monthly_listeners)
+            result = execute_scan(youtube_url, scan_id, plan, min_monthly_listeners, job.get('trim_start'))
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job is not None:
@@ -318,6 +318,14 @@ def scan_beat():
     except (TypeError, ValueError):
         min_monthly_listeners = 0
 
+    # Optional: where in the beat (seconds) the 30 s sample starts. Unset = the usual default.
+    try:
+        trim_start = int(data['trim_start']) if data.get('trim_start') is not None else None
+    except (TypeError, ValueError):
+        trim_start = None
+    if trim_start is not None and not (0 <= trim_start <= 3600):
+        trim_start = None
+
     if not youtube_url:
         return jsonify({
             'success': False,
@@ -341,6 +349,7 @@ def scan_beat():
             # avoidable RapidAPI call instead of running it for an artist the frontend is
             # going to filter out anyway.
             'min_monthly_listeners': min_monthly_listeners,
+            'trim_start': trim_start,
             'created_at': time.time(),
             'started_at': None,
             'finished_at': None,
