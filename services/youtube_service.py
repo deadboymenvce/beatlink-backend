@@ -3,6 +3,7 @@ import time
 import logging
 import tempfile
 import subprocess
+import threading
 import re
 import requests
 
@@ -63,6 +64,7 @@ class YouTubeService:
     """
 
     def __init__(self):
+        self._tl = threading.local()   # per-scan timing of the last download (see last_timing)
         self.temp_dir = tempfile.gettempdir()
         self.api_key = os.getenv("YOUTUBE_API_KEY")
         # RapidAPI key (account-wide, same key covers both hosts below). Set RAPIDAPI_KEY on Render.
@@ -329,6 +331,7 @@ class YouTubeService:
         # qui a fait echouer tous les scans le 19/09 : un seul timeout de 120 s sur le
         # premier compte terminait le telechargement (return False immediat), sans jamais
         # essayer les 6 autres comptes du pool alors qu'ils etaient disponibles.
+        t_req0 = time.time()
         r = None
         for label, key in self.sync_key_rotator.usable_accounts():
             headers = {
@@ -358,6 +361,7 @@ class YouTubeService:
             r = resp
             break
 
+        req_secs = time.time() - t_req0
         if r is None:
             logger.error("❌ [dl] Every usable RapidAPI account failed or is spent")
             return False
@@ -405,6 +409,7 @@ class YouTubeService:
                     fr.close()
                     continue
 
+                t_tx = time.time()
                 written = 0
                 with open(raw_path, 'wb') as f:
                     for chunk in fr.iter_content(chunk_size=8192):
@@ -412,6 +417,10 @@ class YouTubeService:
                             f.write(chunk)
                             written += len(chunk)
                 fr.close()
+                # Where the time goes, for the scan logs: the provider's own request, the wait
+                # until its file is served, then the transfer of the file itself.
+                self._tl.timing = {'request': round(req_secs, 1), 'prep_wait': round(t_tx - started, 1),
+                                   'transfer': round(time.time() - t_tx, 1), 'kb': written // 1024}
                 logger.info(f"✅ [dl] downloaded from {which} after {attempt} poll(s), "
                             f"{int(time.time() - started)}s ({written // 1024} KB)")
                 return True
@@ -550,10 +559,34 @@ class YouTubeService:
             if not self._fetch_raw_via_sync_api(video_id, raw_path, trim_start):
                 logger.error("❌ Audio download failed")
                 return None
-            return self._to_acr_sample(raw_path, video_id)
+            t_enc = time.time()
+            sample = self._to_acr_sample(raw_path, video_id)
+            if isinstance(getattr(self._tl, 'timing', None), dict):
+                self._tl.timing['encode'] = round(time.time() - t_enc, 1)
+            return sample
         except Exception as e:
             logger.error(f"❌ Download error: {str(e)}", exc_info=True)
             return None
+
+    def last_timing(self):
+        """Breakdown (seconds) of this thread's last download: provider request, wait for the
+        file, transfer, encode. Empty when none was measured."""
+        return dict(getattr(self._tl, 'timing', None) or {})
+
+    def cut_sample(self, src_path, seconds, from_end=False, tag='_cut'):
+        """A shorter ACR sample taken from an already encoded one: the first `seconds` of it, or
+        its last `seconds` when from_end. Used to compare what ACRCloud answers to samples of
+        different lengths. Returns the new MP3 path or None."""
+        out = os.path.join(self.temp_dir, f'{os.path.splitext(os.path.basename(src_path))[0]}{tag}{seconds}{"e" if from_end else "s"}.mp3')
+        cmd = ['ffmpeg', '-y', '-v', 'error']
+        if from_end:
+            cmd += ['-sseof', f'-{seconds}']
+        cmd += ['-i', src_path, '-t', str(seconds), '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', out]
+        try:
+            res = subprocess.run(cmd, capture_output=True, timeout=60)
+        except Exception:
+            return None
+        return out if res.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0 else None
 
     def cleanup_audio(self, audio_path):
         """Delete temporary audio file"""
