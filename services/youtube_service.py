@@ -36,7 +36,14 @@ AUDIO_QUALITY = 251          # itag YouTube : opus 64 kbps
 # fichier n'est pas la au bout de 90 s, c'est que le fournisseur est en panne, et attendre
 # davantage ne fait que retarder l'echec.
 PREP_BUDGET_S = 90
+# A longer clip (several ACRCloud samples cut from one download) takes the provider longer to
+# prepare: measured 115 s for a whole video against 40 s for 30 s of it (20/08). Its budget is
+# therefore larger; the 300 s ceiling of a whole job still bounds everything.
+LONG_PREP_BUDGET_S = 150
 POLL_EVERY_S = 3
+SEGMENT_LEN_S = 30
+# Shorter than this and a sample is just the tail of the clip: not worth an ACRCloud request.
+MIN_SEGMENT_BYTES = {'mp3': 128 * 1024, 'wav': 256 * 1024}
 
 def _iso8601_seconds(duration):
     """PT4M13S → 253. Returns 0 for anything unparseable, which drops the video rather
@@ -290,7 +297,7 @@ class YouTubeService:
                 'message': f'Error: {str(e)}'
             }
 
-    def _fetch_raw_via_sync_api(self, video_id, raw_path, trim_start=None):
+    def _fetch_raw_via_sync_api(self, video_id, raw_path, trim_start=None, trim_duration=None):
         """Une requete RapidAPI, puis le fichier deja decoupe a 30 secondes.
 
         GET /download_audio/{id}?quality=251&trim_start_time=30&trim_duration=30 bloque
@@ -310,7 +317,8 @@ class YouTubeService:
         """
         url = (f"https://{self.rapidapi_sync_host}/download_audio/{video_id}"
                f"?quality={AUDIO_QUALITY}&trim_start_time={TRIM_START_S if trim_start is None else trim_start}"
-               f"&trim_duration={TRIM_DURATION_S}")
+               f"&trim_duration={TRIM_DURATION_S if trim_duration is None else trim_duration}")
+        prep_budget = PREP_BUDGET_S if (trim_duration or TRIM_DURATION_S) <= TRIM_DURATION_S else LONG_PREP_BUDGET_S
 
         # ── 1. Le lien : une seule requete RapidAPI par beat ─────────────────
         #
@@ -368,10 +376,10 @@ class YouTubeService:
         if not links:
             logger.error(f"❌ [dl] no download link in response: {str(data)[:200]}")
             return False
-        logger.info(f"🔎 [dl] link ready in ~{PREP_BUDGET_S}s max ({len(links)} host(s))")
+        logger.info(f"🔎 [dl] link ready in ~{prep_budget}s max ({len(links)} host(s))")
 
         # ── 2. L'attente : le 404 veut dire "pas encore pret" ────────────────
-        deadline = time.time() + PREP_BUDGET_S
+        deadline = time.time() + prep_budget
         started = time.time()
         attempt = 0
         while time.time() < deadline:
@@ -411,7 +419,7 @@ class YouTubeService:
             logger.info(f"⏳ [dl] not ready yet (poll {attempt})")
             time.sleep(POLL_EVERY_S)
 
-        logger.error(f"❌ [dl] file never became available within {PREP_BUDGET_S}s")
+        logger.error(f"❌ [dl] file never became available within {prep_budget}s")
         return False
 
     def _to_acr_sample(self, raw_path, video_id):
@@ -436,22 +444,27 @@ class YouTubeService:
         if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
             logger.error("❌ Downloaded file is missing or empty")
             return None
+        return self._encode_sample(raw_path, video_id)
 
+    def _encode_sample(self, raw_path, video_id, ss=0, tag='', min_bytes=None):
+        """Encode 30 seconds of raw_path starting at `ss` seconds (MP3, WAV as the fallback).
+        `tag` keeps the names of several samples cut from one clip apart; `min_bytes` rejects a
+        sample that ran past the end of the clip."""
         for codec, ext, extra in (('libmp3lame', 'mp3', ['-b:a', '128k']),
                                   ('pcm_s16le', 'wav', ['-ar', '16000', '-ac', '1'])):
-            out_path = os.path.join(self.temp_dir, f'beatlink_{video_id}.{ext}')
+            out_path = os.path.join(self.temp_dir, f'beatlink_{video_id}{tag}.{ext}')
             try:
-                logger.info(f"🔄 Encoding ACR sample as {ext} ({codec})")
+                logger.info(f"🔄 Encoding ACR sample as {ext} ({codec}) from {ss}s")
                 res = subprocess.run(
-                    ['ffmpeg', '-y', '-v', 'error', '-i', raw_path,
-                     '-t', '30', '-vn', '-c:a', codec] + extra + [out_path],
+                    ['ffmpeg', '-y', '-v', 'error', '-ss', str(ss), '-i', raw_path,
+                     '-t', str(SEGMENT_LEN_S), '-vn', '-c:a', codec] + extra + [out_path],
                     capture_output=True, timeout=90,
                 )
             except Exception as e:
                 logger.warning(f"⚠️ FFmpeg {ext} encode raised: {e}")
                 continue
 
-            if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > (min_bytes or {}).get(ext, 0):
                 logger.info(f"✅ ACR sample ready: {out_path} "
                             f"({os.path.getsize(out_path) // 1024} KB)")
                 return out_path
@@ -461,6 +474,44 @@ class YouTubeService:
 
         logger.error("❌ Could not produce an ACR sample in any format")
         return None
+
+    def download_segments(self, youtube_url, starts):
+        """ONE download for several ACRCloud samples: the provider prepares a single clip that
+        spans every requested window, and each window is cut from it locally. Returns
+        [{'start': s, 'path': p}, ...] in order (a window past the end of a short video is
+        left out), or None when the download failed (the caller falls back to the usual
+        single 30 s sample)."""
+        video_id = self._extract_video_id(youtube_url)
+        if not video_id or not starts:
+            return None
+        first = starts[0]
+        span = starts[-1] + SEGMENT_LEN_S - first
+        raw_path = os.path.join(self.temp_dir, f'beatlink_{video_id}_long.opus')
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+        out = []
+        try:
+            logger.info(f"🎵 Downloading one {span}s clip for {len(starts)} segments of {video_id}...")
+            if not self._fetch_raw_via_sync_api(video_id, raw_path, trim_start=first, trim_duration=span):
+                return None
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+                return None
+            for i, s in enumerate(starts):
+                path = self._encode_sample(raw_path, video_id, ss=s - first, tag=f'_seg{i}', min_bytes=MIN_SEGMENT_BYTES)
+                if path:
+                    out.append({'start': s, 'path': path})
+                else:
+                    break   # this window ran past the end of the clip, so will the next ones
+            return out or None
+        except Exception as e:
+            logger.error(f"❌ Segment download error: {str(e)}", exc_info=True)
+            return None
+        finally:
+            try:
+                if os.path.exists(raw_path):
+                    os.remove(raw_path)
+            except OSError:
+                pass
 
     def download_audio(self, youtube_url, trim_start=None):
         """Rend un echantillon de 30 secondes pour ACRCloud, ou None.

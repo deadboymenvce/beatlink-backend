@@ -33,8 +33,14 @@ class ACRCloudService:
         ).decode('utf-8')
  
     def identify_audio(self, audio_file_path):
+        """Same as identify_audio_ex, matches only (kept for the callers that want just the list)."""
+        return self.identify_audio_ex(audio_file_path)['matches']
+
+    def identify_audio_ex(self, audio_file_path):
         """
-        Identify audio file using ACR Cloud
+        Identify audio file using ACR Cloud. Returns {'matches': [...], 'status': ..., 'code': ...}
+        where status is 'ok' (matches), 'none' (ACRCloud answered: nothing found) or 'error'
+        (the call itself failed: the code tells why). An error used to read as "no match".
         
         Returns:
         List of matched songs with complete data (score >= 55%)
@@ -50,7 +56,7 @@ class ACRCloudService:
         """
         if not os.path.exists(audio_file_path):
             logger.error(f"❌ Audio file not found: {audio_file_path}")
-            return []
+            return {'matches': [], 'status': 'error', 'code': 'no_file'}
         
         try:
             logger.info(f"🔍 Identifying audio with ACR Cloud...")
@@ -96,7 +102,7 @@ class ACRCloudService:
             
             if response.status_code != 200:
                 logger.error(f"❌ ACR Cloud API error: {response.status_code}")
-                return []
+                return {'matches': [], 'status': 'error', 'code': f'http_{response.status_code}'}
             
             result = response.json()
             
@@ -107,11 +113,12 @@ class ACRCloudService:
             if status_code != 0:
                 if status_code == 1001:
                     logger.info("ℹ️ No matches found in ACR Cloud")
+                    return {'matches': [], 'status': 'none', 'code': status_code}
                 elif status_code == 3001:
                     logger.error("❌ ACR Cloud quota exceeded")
                 else:
                     logger.error(f"❌ ACR Cloud error: {status_code} - {status_msg}")
-                return []
+                return {'matches': [], 'status': 'error', 'code': status_code}
             
             # Parse results
             metadata = result.get('metadata', {})
@@ -119,7 +126,7 @@ class ACRCloudService:
             
             if not music_list:
                 logger.info("ℹ️ No music matches found")
-                return []
+                return {'matches': [], 'status': 'none', 'code': 0}
             
             logger.info(f"📊 ACR Cloud returned {len(music_list)} raw results")
             
@@ -215,13 +222,13 @@ class ACRCloudService:
             
             logger.info(f"✅ Found {len(matches)} valid matches (score >= 40%)")
             
-            return matches
+            return {'matches': matches, 'status': 'ok' if matches else 'none', 'code': 0}
             
         except requests.exceptions.Timeout:
             logger.error("❌ ACR Cloud timeout (30s)")
-            return []
+            return {'matches': [], 'status': 'error', 'code': 'timeout'}
             
         except Exception as e:
             logger.error(f"❌ ACR Cloud error: {str(e)}", exc_info=True)
-            return []
+            return {'matches': [], 'status': 'error', 'code': 'exception'}
  
