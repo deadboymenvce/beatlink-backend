@@ -108,6 +108,8 @@ ALT_SOURCE_PLANS = None  # None = every plan; a set would restrict to those plan
 # ACRCloud answers at most 10 matches per request, so a beat that fills a window has more
 # artists than that window shows. Each later window is cut from the SAME download.
 SEGMENT_STARTS_S = (30, 80, 130)   # where each 30 s sample starts, in seconds
+SUSPECT_VIEWS = 100000             # a beat this popular...
+SUSPECT_MAX_RESULTS = 2            # ...with this few results is not kept in the beat cache
 
 
 def _after_first_window(first_count, low_potential):
@@ -208,6 +210,11 @@ def execute_scan(youtube_url, scan_id, plan=None, min_monthly_listeners=0, trim_
             """Keep this result for the next producer, unless an ACRCloud call failed (it would
             freeze a partial answer). Off the scan's critical path."""
             if not use_cache or any(r['status'] == 'error' for r in seg_report):
+                return
+            # A popular beat that comes back with almost nothing is more likely a bad sample than a
+            # beat nobody used (the same video has answered 1 and 10 on different runs): not kept,
+            # so the next producer's scan gets a fresh look instead of the same poor answer.
+            if (video_info.get('views') or 0) >= SUSPECT_VIEWS and len(result.get('matched_songs') or []) <= SUSPECT_MAX_RESULTS:
                 return
             import threading
             threading.Thread(target=store_beat_cache, args=(video_id, result, windows, empty), daemon=True).start()
